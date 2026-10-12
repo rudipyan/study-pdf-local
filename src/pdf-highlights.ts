@@ -1,10 +1,10 @@
-// Reads every /Highlight annotation out of the viewer's LIVE pdf.js document:
-// no file re-parse, and no need to bundle our own copy of pdf.js. Shared by the
-// highlights modal and the "Export highlights to note" command, so both see the
-// same list in the same order.
+// Reads every /Highlight annotation out of a temporary PDF.js document parsed
+// from the same immutable byte snapshot used for its stored metadata. No need
+// to bundle our own copy of pdf.js.
 //
 // No Obsidian imports -- the pdf.js document is passed in.
-import { quadPointsToRects, extractQuote, type PdfJsTextItem } from './pdf-text-extraction';
+import { quadPointsToRects, extractQuote, normalizeQuote, type PdfJsTextItem } from './pdf-text-extraction';
+import type { StoredQuotesByReference } from './annotate';
 
 export interface HighlightEntry {
 	pageNumber: number;
@@ -40,33 +40,73 @@ export interface PdfJsDocument {
 	getPage(pageNumber: number): Promise<PdfJsPage>;
 }
 
+export interface CollectHighlightsOptions {
+	signal?: AbortSignal;
+	onProgress?: (pageNumber: number, pageCount: number) => void;
+}
+
+function assertScanActive(signal?: AbortSignal): void {
+	if (!signal?.aborted) return;
+	const error = new Error('The highlights scan was cancelled.');
+	error.name = 'AbortError';
+	throw error;
+}
+
+function isLegacyTruncatedQuote(quote: string): boolean {
+	return quote.length === 300 && quote.endsWith('…');
+}
+
+function shouldYield(pdfjsDoc: PdfJsDocument, pageNumber: number): boolean {
+	return pdfjsDoc.numPages >= 64 && pageNumber % 4 === 0;
+}
+
 export async function collectHighlights(
 	pdfjsDoc: PdfJsDocument,
-	storedQuotes: Map<number, (string | null)[]>,
+	storedQuotes: StoredQuotesByReference,
+	options: CollectHighlightsOptions = {},
 ): Promise<HighlightEntry[]> {
 	const entries: HighlightEntry[] = [];
 	for (let pageNumber = 1; pageNumber <= pdfjsDoc.numPages; pageNumber++) {
+		assertScanActive(options.signal);
 		const page = await pdfjsDoc.getPage(pageNumber);
 		const annotations = await page.getAnnotations();
 		const highlights = annotations.filter((a) => a.subtype === 'Highlight');
-		if (highlights.length === 0) continue;
-
-		const textContent = await page.getTextContent();
-		// 0-based to match getStoredQuotes' keys; order matches its own
-		// per-page Highlight-only array (see that function's doc comment).
-		const pageStoredQuotes = storedQuotes.get(pageNumber - 1);
-		highlights.forEach((annotation, indexOnPage) => {
+		const pageStoredQuotes = storedQuotes.byAnnotationId.get(pageNumber - 1);
+		let textItems: PdfJsTextItem[] | null = null;
+		for (const annotation of highlights) {
+			assertScanActive(options.signal);
 			const rects = quadPointsToRects(annotation.quadPoints);
+			const metadata = annotation.id ? pageStoredQuotes?.get(annotation.id) : null;
+			const storedQuote = metadata?.quote ?? null;
+			const needsRecovery = !metadata?.isRegion && (storedQuote === null || isLegacyTruncatedQuote(storedQuote));
+			let recoveredQuote = '';
+			if (needsRecovery && rects.length > 0) {
+				textItems ??= (await page.getTextContent()).items;
+				assertScanActive(options.signal);
+				recoveredQuote = extractQuote(rects, textItems);
+			}
+			const quote = metadata?.isRegion
+				? normalizeQuote(storedQuote ?? '')
+				: storedQuote === null
+				? recoveredQuote
+				: isLegacyTruncatedQuote(storedQuote) && recoveredQuote.startsWith(storedQuote.slice(0, -1))
+					? recoveredQuote
+					: normalizeQuote(storedQuote);
 			const [r, g, b] = annotation.color ?? [255, 255, 0];
 			entries.push({
 				pageNumber,
 				top: rects[0]?.top ?? 0,
 				colorCss: `rgb(${r}, ${g}, ${b})`,
-				quote: pageStoredQuotes?.[indexOnPage] || extractQuote(rects, textContent.items),
+				quote,
 				note: annotation.contentsObj?.str?.trim() || null,
 				annotationId: annotation.id ?? null,
 			});
-		});
+		}
+		options.onProgress?.(pageNumber, pdfjsDoc.numPages);
+		if (shouldYield(pdfjsDoc, pageNumber)) {
+			await new Promise<void>((resolve) => setTimeout(resolve, 0));
+			assertScanActive(options.signal);
+		}
 	}
 	// Reading order: page ascending, then top-of-page first (PDF y grows upward).
 	// Two highlights on the same line tie on `top`; a stable sort leaves them in

@@ -18,6 +18,10 @@
 	background-color: var(--color-accent);
 }
 
+.textLayer.textLayer.textLayer.study-pdf-pencil-selection-active ::selection {
+	background-color: var(--study-pdf-pencil-selection-color);
+}
+
 /* Mobile selection overlay (see src/ui/selection-overlay.ts). iOS honours no
    ::selection property at all inside the PDF text layer -- confirmed on-device
    with an opaque red background AND yellow glyphs at the highest specificity in
@@ -63,6 +67,8 @@
 .study-pdf-popup-row {
 	display: flex;
 	align-items: center;
+	flex-wrap: wrap;
+	max-width: 100%;
 	gap: var(--size-2-1);
 }
 
@@ -80,6 +86,190 @@
 	min-height: 60px;
 	resize: vertical;
 	font-size: var(--font-ui-small);
+}
+
+.study-pdf-note-status {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	min-width: 20px;
+	min-height: 20px;
+	color: var(--text-muted);
+}
+
+.study-pdf-note-status[data-state="failed"] {
+	color: var(--text-error);
+}
+
+.study-pdf-note-status[data-state="saved"] {
+	color: var(--text-success);
+}
+
+.study-pdf-palette-editor {
+	display: flex;
+	flex-direction: column;
+	gap: var(--size-4-2);
+}
+
+.study-pdf-palette-toolbar p {
+	margin: 0 0 var(--size-2-2);
+	color: var(--text-muted);
+}
+
+.study-pdf-palette-row {
+	display: grid;
+	grid-template-columns: minmax(100px, 1fr) auto minmax(100px, 1fr);
+	align-items: end;
+	gap: var(--size-2-3);
+	padding: var(--size-2-3);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-m);
+}
+
+.study-pdf-palette-actions {
+	grid-column: 1 / -1;
+}
+
+.study-pdf-palette-field {
+	display: flex;
+	flex-direction: column;
+	gap: var(--size-2-1);
+	min-width: 0;
+}
+
+.study-pdf-palette-field input[type="text"] {
+	width: 100%;
+}
+
+.study-pdf-palette-picker-field input[type="color"] {
+	width: 48px;
+	min-height: 36px;
+	padding: 2px;
+}
+
+.study-pdf-palette-error {
+	min-height: 1em;
+	color: var(--text-error);
+	font-size: var(--font-ui-smaller);
+}
+
+.study-pdf-palette-actions,
+.study-pdf-candidate-actions,
+.study-pdf-candidate-color-options {
+	display: flex;
+	align-items: center;
+	flex-wrap: wrap;
+	gap: var(--size-2-2);
+}
+
+.study-pdf-palette-actions {
+	justify-content: flex-end;
+}
+
+.study-pdf-default-indicator {
+	display: inline-flex;
+	align-items: center;
+	gap: var(--size-2-1);
+	font-size: var(--font-ui-smaller);
+	font-weight: 600;
+}
+
+.study-pdf-default-indicator {
+	color: var(--text-accent);
+}
+
+.study-pdf-candidate-modal {
+	width: max-content;
+	max-width: min(460px, calc(100vw - 8px));
+	max-height: min(78vh, calc(100vh - 8px));
+	max-height: min(78vh, calc(100dvh - 8px));
+	overflow: hidden;
+}
+
+.study-pdf-palette-modal {
+	max-height: min(78vh, calc(100vh - 24px));
+	max-height: min(78vh, calc(100dvh - 24px));
+	overflow-y: auto;
+}
+
+.study-pdf-candidate-list {
+	display: flex;
+	flex-direction: column;
+	gap: var(--size-2-2);
+	min-height: 0;
+	overflow: auto;
+	overscroll-behavior: contain;
+}
+
+.study-pdf-candidate {
+	display: flex;
+	flex-direction: column;
+	gap: var(--size-2-2);
+	padding: var(--size-2-2);
+	border-radius: var(--radius-s);
+}
+
+.study-pdf-candidate + .study-pdf-candidate {
+	border-top: 1px solid var(--background-modifier-border);
+}
+
+.study-pdf-candidate-label {
+	font-size: var(--font-ui-smaller);
+	color: var(--text-muted);
+}
+
+.study-pdf-candidate-color-options {
+	gap: var(--size-2-1);
+}
+
+.study-pdf-candidate-unsupported {
+	color: var(--text-warning);
+	font-size: var(--font-ui-smaller);
+}
+
+.study-pdf-annotation-color {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 32px;
+	min-width: 32px;
+	height: 32px;
+	padding: 0;
+	border: 1px solid transparent;
+	background: transparent;
+	box-shadow: none;
+}
+
+/* Obsidian's tablet button padding would otherwise squeeze out the swatch. */
+.study-pdf-popup button.study-pdf-annotation-color {
+	padding: 0;
+}
+
+.study-pdf-annotation-color[aria-pressed="true"] {
+	border-color: var(--text-normal);
+	background: var(--background-modifier-hover);
+}
+
+.study-pdf-annotation-color:focus-visible {
+	outline: 2px solid var(--interactive-accent);
+	outline-offset: 2px;
+}
+
+.study-pdf-remove-dot {
+	position: relative;
+	background-color: #fff;
+}
+
+.study-pdf-remove-dot::after {
+	content: '';
+	position: absolute;
+	left: 50%;
+	top: 50%;
+	width: 2px;
+	height: 95%;
+	background-color: #d32f2f;
+	transform: translate(-50%, -50%) rotate(40deg);
+	border-radius: 1px;
 }
 
 /* Snapshot overlay that hides the blank flash while Obsidian fully reloads the
@@ -105,6 +295,7 @@
 
 .study-pdf-color-dot {
 	display: block;
+	flex-shrink: 0;
 	width: 14px;
 	height: 14px;
 	border-radius: 50%;
@@ -162,6 +353,7 @@
 
 .study-pdf-list-toolbar {
 	display: flex;
+	flex-wrap: wrap;
 	justify-content: flex-end;
 	gap: var(--size-4-2);
 	padding-bottom: var(--size-4-2);
@@ -174,6 +366,59 @@
 
 .study-pdf-list-copy {
 	flex-shrink: 0;
+}
+
+.study-pdf-list-row > input[type="checkbox"] {
+	flex: 0 0 auto;
+	margin-top: 3px;
+}
+
+@media (max-width: 480px) {
+	.study-pdf-list-row {
+		display: grid;
+		grid-template-columns: auto auto minmax(0, 1fr) auto auto;
+		grid-template-rows: auto auto;
+		align-items: center;
+	}
+
+	.study-pdf-list-row > input[type="checkbox"] {
+		grid-column: 1;
+		grid-row: 1;
+		margin: 0;
+	}
+
+	.study-pdf-list-row > .study-pdf-color-dot {
+		grid-column: 2;
+		grid-row: 1;
+		margin: 0;
+	}
+
+	.study-pdf-list-body {
+		grid-column: 1 / -1;
+		grid-row: 2;
+	}
+
+	.study-pdf-list-page {
+		grid-column: 3;
+		grid-row: 1;
+	}
+
+	.study-pdf-list-copy:nth-last-child(2) {
+		grid-column: 4;
+		grid-row: 1;
+	}
+
+	.study-pdf-list-copy:last-child {
+		grid-column: 5;
+		grid-row: 1;
+	}
+
+	.study-pdf-list-quote {
+		display: -webkit-box;
+		overflow: hidden;
+		-webkit-box-orient: vertical;
+		-webkit-line-clamp: 3;
+	}
 }
 
 /* Touch sizing. The popup's controls are ~14px dots inside mouse-sized padding,
@@ -215,7 +460,317 @@
 		min-height: 80px;
 	}
 
+	.study-pdf-palette-row {
+		grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+	}
+
+	.study-pdf-palette-field input[type="text"] {
+		min-height: 44px;
+	}
+
+	.study-pdf-palette-picker-field input[type="color"] {
+		min-width: 44px;
+		min-height: 44px;
+	}
+
+	.study-pdf-palette-picker-field {
+		grid-column: 1;
+	}
+
+	.study-pdf-palette-actions {
+		grid-column: 1 / -1;
+		justify-content: flex-start;
+	}
+
+	.study-pdf-candidate-actions button,
+	.study-pdf-annotation-color,
+	.study-pdf-palette-actions button,
+	.study-pdf-palette-toolbar button {
+		min-width: 44px;
+		min-height: 44px;
+	}
+
 	.study-pdf-list-row {
 		padding: var(--size-4-3);
+	}
+}
+
+/* Pending annotation visuals do not intercept text selection. */
+.study-pdf-highlight-preview {
+	position: absolute;
+	inset: 0;
+	width: 100%;
+	height: 100%;
+	pointer-events: none;
+	user-select: none;
+	mix-blend-mode: multiply;
+}
+
+.study-pdf-page-preview {
+	position: absolute;
+	inset: 0;
+	pointer-events: none;
+	user-select: none;
+	z-index: 2;
+}
+
+/* One persistent annotation row outside the PDF scroller. Only its leading
+   tools scroll; the Focus controls stay pinned at the visible pane edge. */
+.study-pdf-annotation-toolbar {
+	position: relative;
+	z-index: 1;
+	display: flex;
+	flex: 0 0 auto;
+	align-items: center;
+	justify-content: center;
+	min-width: 0;
+	width: 100%;
+	max-width: 100%;
+	box-sizing: border-box;
+	padding: var(--size-2-1) var(--size-2-2);
+	overflow: hidden;
+	background: var(--background-primary);
+	border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.study-pdf-toolbar-inner {
+	display: flex;
+	flex: 0 1 auto;
+	align-items: center;
+	gap: var(--size-2-1);
+	width: max-content;
+	max-width: 100%;
+	min-width: 0;
+	margin-inline: auto;
+}
+
+.study-pdf-toolbar-scroll {
+	display: flex;
+	flex: 0 1 auto;
+	align-items: center;
+	gap: 2px;
+	min-width: 0;
+	overflow-x: auto;
+	overflow-y: hidden;
+	overscroll-behavior-x: contain;
+	scrollbar-width: none;
+}
+
+.study-pdf-toolbar-scroll::-webkit-scrollbar {
+	display: none;
+}
+
+.study-pdf-toolbar-pinned {
+	display: flex;
+	flex: 0 0 auto;
+	align-items: center;
+	gap: 2px;
+}
+
+.study-pdf-action-tools[hidden] {
+	display: none !important;
+}
+
+.study-pdf-toolbar-modes,
+.study-pdf-toolbar-history,
+.study-pdf-toolbar-fit,
+.study-pdf-toolbar-palette {
+	display: flex;
+	flex: 0 0 auto;
+	align-items: center;
+	gap: 2px;
+}
+
+.study-pdf-toolbar-modes {
+	gap: 0;
+	padding: 2px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-m);
+	background: var(--background-secondary);
+}
+
+.study-pdf-toolbar-modes .study-pdf-tool-button {
+	border: 0;
+	border-radius: var(--radius-s);
+	box-shadow: none;
+}
+
+.study-pdf-toolbar-modes .study-pdf-tool-button[aria-pressed="true"] {
+	background: var(--background-modifier-hover);
+	box-shadow: inset 0 0 0 1px var(--background-modifier-border);
+}
+
+.study-pdf-toolbar-history,
+.study-pdf-toolbar-fit,
+.study-pdf-toolbar-palette {
+	padding-left: var(--size-2-1);
+	border-left: 1px solid var(--background-modifier-border);
+}
+
+.study-pdf-annotation-toolbar .study-pdf-tool-button {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	flex: 0 0 auto;
+	min-width: 32px;
+	min-height: 32px;
+	padding: 0;
+	color: var(--text-normal);
+}
+
+.study-pdf-tool-button[aria-pressed="true"] {
+	color: var(--text-normal);
+	background: var(--background-modifier-hover);
+	box-shadow: inset 0 0 0 1px var(--background-modifier-border-hover);
+}
+
+.study-pdf-tool-button:focus-visible,
+.study-pdf-annotation-toolbar .study-pdf-annotation-color:focus-visible {
+	outline: 2px solid var(--interactive-accent);
+	outline-offset: -2px;
+}
+
+.study-pdf-annotation-toolbar button.study-pdf-annotation-color {
+	display: inline-flex;
+	flex: 0 0 auto;
+	align-items: center;
+	justify-content: center;
+	width: 32px;
+	min-width: 32px;
+	min-height: 32px;
+	padding: 0;
+	border: 1px solid transparent;
+	border-radius: var(--radius-m);
+	background: transparent;
+}
+
+.study-pdf-annotation-toolbar .study-pdf-annotation-color[aria-pressed="true"] {
+	background: transparent;
+	box-shadow: none;
+}
+
+.study-pdf-annotation-toolbar .study-pdf-color-dot {
+	width: 18px;
+	height: 18px;
+}
+
+.study-pdf-annotation-toolbar .study-pdf-annotation-color[aria-pressed="true"] .study-pdf-color-dot {
+	outline: 1px solid var(--background-primary);
+	box-shadow: 0 0 0 2px var(--interactive-accent);
+}
+
+@media (pointer: coarse) {
+	.study-pdf-annotation-toolbar .study-pdf-tool-button,
+	.study-pdf-annotation-toolbar button.study-pdf-annotation-color {
+		min-width: 44px;
+		min-height: 44px;
+	}
+
+	.study-pdf-annotation-toolbar button.study-pdf-annotation-color {
+		width: 44px;
+	}
+
+	.study-pdf-annotation-toolbar .study-pdf-color-dot {
+		width: 18px;
+		height: 18px;
+	}
+}
+
+/* The exact owning PDF leaf is promoted above Obsidian's chrome. Its native
+   PDF scroller is left alone so page geometry, selection and PDF.js zoom stay
+   native. */
+.workspace-leaf.study-pdf-focus {
+	position: fixed !important;
+	inset: 0 !important;
+	width: 100vw !important;
+	height: 100vh !important;
+	height: 100dvh !important;
+	max-width: none !important;
+	max-height: none !important;
+	contain: none !important;
+	overflow: visible !important;
+	z-index: 20 !important;
+	--view-top-spacing: 0px !important;
+	--view-bottom-spacing: var(--safe-area-inset-bottom, env(safe-area-inset-bottom, 0px)) !important;
+}
+
+.workspace-leaf.study-pdf-focus .view-header,
+.workspace-leaf.study-pdf-focus:not(.study-pdf-focus-tools) .pdf-toolbar {
+	display: none !important;
+}
+
+.workspace-leaf.study-pdf-focus .workspace-leaf-content[data-type="pdf"],
+.workspace-leaf.study-pdf-focus .view-content,
+.workspace-leaf.study-pdf-focus .pdf-container {
+	min-height: 0;
+	min-width: 0 !important;
+	height: 100%;
+}
+
+.workspace-leaf.study-pdf-focus .pdf-content-container {
+	min-width: 0 !important;
+}
+
+.workspace-leaf.study-pdf-focus .view-content {
+	margin-top: 0 !important;
+}
+
+.workspace-leaf.study-pdf-focus .study-pdf-annotation-toolbar {
+	position: relative;
+	z-index: 3;
+	padding-top: calc(var(--safe-area-inset-top, env(safe-area-inset-top, 0px)) + var(--size-2-1));
+	padding-left: calc(var(--safe-area-inset-left, env(safe-area-inset-left, 0px)) + var(--size-2-2));
+	padding-right: calc(var(--safe-area-inset-right, env(safe-area-inset-right, 0px)) + var(--size-2-2));
+}
+
+body.mod-macos:is(.is-frameless, .is-hidden-frameless):not(.is-fullscreen):not(.is-mobile)
+	.workspace-leaf.study-pdf-focus .study-pdf-annotation-toolbar {
+	padding-top: calc(max(
+		var(--titlebar-height, 30px),
+		var(--traffic-lights-offset-y, 40px),
+		var(--safe-area-inset-top, env(safe-area-inset-top, 0px))
+	) + var(--size-2-1));
+}
+
+.pdf-viewer-container.study-pdf-horizontal-scroll-stable {
+	overflow-x: hidden !important;
+}
+
+body.study-pdf-focus-active .mobile-navbar {
+	display: none !important;
+}
+
+.study-pdf-horizontal-scroll-stable {
+	/* Only active while every visible page fits the PDF viewport. */
+	overscroll-behavior-x: none;
+}
+
+@supports (background: color-mix(in srgb, var(--background-primary) 82%, transparent)) {
+	.workspace-leaf.study-pdf-focus .study-pdf-annotation-toolbar {
+		background: color-mix(in srgb, var(--background-primary) 82%, transparent);
+		backdrop-filter: blur(8px);
+		-webkit-backdrop-filter: blur(8px);
+	}
+}
+
+@media (prefers-reduced-transparency: reduce) {
+	.workspace-leaf.study-pdf-focus .study-pdf-annotation-toolbar {
+		background: var(--background-primary);
+		backdrop-filter: none;
+		-webkit-backdrop-filter: none;
+	}
+}
+
+@media (forced-colors: active) {
+	.workspace-leaf.study-pdf-focus .study-pdf-annotation-toolbar {
+		color: CanvasText;
+		background: Canvas;
+		border-color: CanvasText;
+		backdrop-filter: none;
+		-webkit-backdrop-filter: none;
+	}
+
+	.study-pdf-annotation-toolbar .study-pdf-color-dot {
+		forced-color-adjust: none;
 	}
 }

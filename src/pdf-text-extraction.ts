@@ -18,7 +18,7 @@ export interface PdfJsTextItem {
 	width?: number;
 }
 
-const MAX_QUOTE_LENGTH = 300;
+const MAX_QUOTE_EXCERPT_LENGTH = 300;
 
 /** Normalizes pdf.js's quadPoints across the shapes it has shipped over time:
  * a flat numeric array-like (8 numbers per quad) or nested point-object arrays. */
@@ -45,13 +45,18 @@ export function quadPointsToRects(quadPoints: unknown): QuadRect[] {
 	return rects;
 }
 
-/** Normalizes whitespace and enforces the display/storage length cap. Shared
- * by extractQuote's geometric reconstruction and by the exact quote captured
- * at highlight-creation time (see annotate.ts's `quote` option), so both
- * paths produce the same shape of string. */
+/** Normalizes whitespace without losing text. Quotes are stored in full; only
+ * presentation paths should call excerptQuote. */
 export function normalizeQuote(text: string): string {
-	const quote = text.replace(/\s+/g, ' ').trim();
-	return quote.length > MAX_QUOTE_LENGTH ? quote.slice(0, MAX_QUOTE_LENGTH - 1) + '…' : quote;
+	return text.replace(/\s+/g, ' ').trim();
+}
+
+/** A bounded label for list rows and other compact previews. */
+export function excerptQuote(text: string): string {
+	const quote = normalizeQuote(text);
+	return quote.length > MAX_QUOTE_EXCERPT_LENGTH
+		? `${quote.slice(0, MAX_QUOTE_EXCERPT_LENGTH - 1)}…`
+		: quote;
 }
 
 interface WordSpan {

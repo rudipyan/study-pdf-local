@@ -9,6 +9,7 @@ import {
 	inspectHighlightAt,
 	buildHighlightIndex,
 	findHighlightInIndex,
+	setHighlightColorAt,
 	setHighlightNoteAt,
 	getStoredQuotes,
 } from '../src/annotate';
@@ -285,7 +286,7 @@ describe('addHighlightAnnotation', () => {
 		expect(highlights).toHaveLength(1);
 	});
 
-	it('draws one appearance rect per quad, not one rect over the whole union box (multi-line safety)', async () => {
+	it('draws one polygon path per quad, not one shape over the whole union box (multi-line safety)', async () => {
 		// Two disjoint quads (as a two-line selection with a gap would produce).
 		// The union box spans the gap; the appearance stream must not fill it.
 		const bytes = await makeFixturePdfBytes();
@@ -298,8 +299,8 @@ describe('addHighlightAnnotation', () => {
 		const highlighted = await addHighlightAnnotation(bytes, { pageIndex: 0, quadPoints, box, color: YELLOW });
 
 		// Read the /AP stream's actual content back out via pdf-lib and confirm it
-		// contains two separate `re` (rectangle) fills -- not one rect spanning the
-		// full union-box height, which would paint over the gap between the lines.
+		// contains two separate polygon paths, not one shape spanning the full
+		// union-box height, which would paint over the gap between the lines.
 		const reloaded = await PDFDocument.load(highlighted);
 		const page = reloaded.getPage(0);
 		const annots = page.node.lookupMaybe(PDFName.of('Annots'), PDFArray)!;
@@ -308,9 +309,37 @@ describe('addHighlightAnnotation', () => {
 		const ap = reloaded.context.lookup(annotDict.get(PDFName.of('AP'))) as any; // eslint-disable-line @typescript-eslint/no-explicit-any
 		const apStream = reloaded.context.lookup(ap.get(PDFName.of('N'))) as PDFRawStream;
 		const content = apStream.getContentsString();
-		const reCount = (content.match(/ re\b/g) ?? []).length;
+		const moveCount = (content.match(/ m\b/g) ?? []).length;
 
-		expect(reCount).toBe(2);
+		expect(moveCount).toBe(2);
+		expect(content).not.toContain(' re');
+	});
+});
+
+describe('recolor preserves the PDF.js annotation identity', () => {
+	it('keeps the same PDF.js annotation id after two color changes', async () => {
+		const box = { left: 50, right: 150, top: 220, bottom: 200 };
+		const quad = [box.left, box.top, box.right, box.top, box.left, box.bottom, box.right, box.bottom];
+		const bytes = await addHighlightAnnotation(await makeFixturePdfBytes(), {
+			pageIndex: 0, quadPoints: quad, box, color: YELLOW, quote: 'stable identity',
+		});
+		const beforePdfjs = await loadPdfjsDoc(bytes);
+		const beforeAnnotations = await (await beforePdfjs.getPage(1)).getAnnotations();
+		const beforeId = beforeAnnotations.find((annotation: { subtype: string }) => annotation.subtype === 'Highlight')!.id;
+		const inspected = await inspectHighlightAt(bytes, { pageIndex: 0, box: { left: 100, right: 100, top: 210, bottom: 210 } });
+		if (!inspected?.target) throw new Error('Fixture highlight did not expose an indirect recolor target.');
+		const firstRecolor = await setHighlightColorAt(bytes, {
+			...inspected.target,
+			color: { r: 0.12, g: 0.34, b: 0.78 },
+		});
+		const secondRecolor = await setHighlightColorAt(firstRecolor.bytes, {
+			...firstRecolor.target,
+			color: YELLOW,
+		});
+		const afterPdfjs = await loadPdfjsDoc(secondRecolor.bytes);
+		const afterAnnotations = await (await afterPdfjs.getPage(1)).getAnnotations();
+		const afterId = afterAnnotations.find((annotation: { subtype: string }) => annotation.subtype === 'Highlight')!.id;
+		expect(afterId).toBe(beforeId);
 	});
 });
 
@@ -644,7 +673,7 @@ describe('highlight notes (annotation /Contents)', () => {
 		expect(annots).toHaveLength(1);
 		expect(annots[0].contentsObj.str).toBe(note);
 
-		expect(await inspectHighlightAt(result.bytes, { pageIndex: 0, box: point })).toEqual({ note });
+		expect(await inspectHighlightAt(result.bytes, { pageIndex: 0, box: point })).toMatchObject({ note });
 	});
 
 	it('replaces an existing note when set again', async () => {
@@ -652,7 +681,7 @@ describe('highlight notes (annotation /Contents)', () => {
 		const first = await setHighlightNoteAt(highlighted, { pageIndex: 0, box: point, note: 'first' });
 		const second = await setHighlightNoteAt(first.bytes, { pageIndex: 0, box: point, note: 'second' });
 		expect(second.updatedCount).toBe(1);
-		expect(await inspectHighlightAt(second.bytes, { pageIndex: 0, box: point })).toEqual({ note: 'second' });
+		expect(await inspectHighlightAt(second.bytes, { pageIndex: 0, box: point })).toMatchObject({ note: 'second' });
 	});
 
 	it('removes the note (but keeps the highlight) when set to empty/whitespace', async () => {
@@ -660,7 +689,7 @@ describe('highlight notes (annotation /Contents)', () => {
 		const noted = await setHighlightNoteAt(highlighted, { pageIndex: 0, box: point, note: 'temp' });
 		const cleared = await setHighlightNoteAt(noted.bytes, { pageIndex: 0, box: point, note: '   ' });
 		expect(cleared.updatedCount).toBe(1);
-		expect(await inspectHighlightAt(cleared.bytes, { pageIndex: 0, box: point })).toEqual({ note: null });
+		expect(await inspectHighlightAt(cleared.bytes, { pageIndex: 0, box: point })).toMatchObject({ note: null });
 		expect(await hasHighlightAt(cleared.bytes, { pageIndex: 0, box: point })).toBe(true);
 	});
 
@@ -675,7 +704,7 @@ describe('highlight notes (annotation /Contents)', () => {
 		const base = await makeFixturePdfBytes();
 		expect(await inspectHighlightAt(base, { pageIndex: 0, box: point })).toBeNull();
 		const highlighted = await makeHighlightedBytes();
-		expect(await inspectHighlightAt(highlighted, { pageIndex: 0, box: point })).toEqual({ note: null });
+		expect(await inspectHighlightAt(highlighted, { pageIndex: 0, box: point })).toMatchObject({ note: null });
 	});
 
 	it('fails fast with a clear message on a PDF that genuinely requires a password to open', async () => {
@@ -730,7 +759,7 @@ describe('buildHighlightIndex / findHighlightInIndex', () => {
 		const withNote = await setHighlightNoteAt(highlighted, { pageIndex: 0, box: { left: 50, right: 50, top: 210, bottom: 210 }, note: 'hello' });
 
 		const point = { left: 50, right: 50, top: 210, bottom: 210 };
-		expect(findHighlightInIndex(await buildHighlightIndex(withNote.bytes), { pageIndex: 0, box: point })).toEqual({
+		expect(findHighlightInIndex(await buildHighlightIndex(withNote.bytes), { pageIndex: 0, box: point })).toMatchObject({
 			note: 'hello',
 		});
 		await expectAgreementAcrossGrid(withNote.bytes);
@@ -784,8 +813,8 @@ describe('buildHighlightIndex / findHighlightInIndex', () => {
 		// test fast steps straight over a 20pt-tall band, so the sweep below proves
 		// agreement but cannot prove the highlight was ever found.
 		const centre = { left: 100, right: 100, top: 390, bottom: 390 };
-		expect(await inspectHighlightAt(bytes, { pageIndex: 1, box: centre })).toEqual({ note: null });
-		expect(findHighlightInIndex(index, { pageIndex: 1, box: centre })).toEqual({ note: null });
+		expect(await inspectHighlightAt(bytes, { pageIndex: 1, box: centre })).toMatchObject({ note: null });
+		expect(findHighlightInIndex(index, { pageIndex: 1, box: centre })).toMatchObject({ note: null });
 		// ...and the highlight must not bleed onto its neighbours.
 		expect(findHighlightInIndex(index, { pageIndex: 0, box: centre })).toBeNull();
 		expect(findHighlightInIndex(index, { pageIndex: 2, box: centre })).toBeNull();
@@ -865,8 +894,8 @@ describe('neighbouring highlights are told apart by their quads, not their /Rect
 		})).bytes;
 		bytes = (await setHighlightNoteAt(bytes, { pageIndex: 0, box: CLICK, note: 'about the next sentence' })).bytes;
 
-		expect(await inspectHighlightAt(bytes, { pageIndex: 0, box: CLICK })).toEqual({ note: 'about the next sentence' });
-		expect(findHighlightInIndex(await buildHighlightIndex(bytes), { pageIndex: 0, box: CLICK })).toEqual({
+		expect(await inspectHighlightAt(bytes, { pageIndex: 0, box: CLICK })).toMatchObject({ note: 'about the next sentence' });
+		expect(findHighlightInIndex(await buildHighlightIndex(bytes), { pageIndex: 0, box: CLICK })).toMatchObject({
 			note: 'about the next sentence',
 		});
 	});

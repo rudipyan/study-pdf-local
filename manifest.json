@@ -1,10 +1,10 @@
 {
-	"id": "study-pdf",
-	"name": "Study PDF",
-	"version": "0.4.4",
+	"id": "study-pdf-local",
+	"name": "Study PDF Local",
+	"version": "0.5.0",
 	"minAppVersion": "1.4.4",
-	"description": "Highlight text and add notes to PDFs, saved into the file itself so they work in any reader — then browse them all, export them to a note, or turn your notes into spaced-repetition flashcards.",
-	"author": "João Gris",
-	"authorUrl": "https://gris.dev",
+	"description": "Highlight PDFs with custom colors, edit comments, and export annotations and quotations.",
+	"author": "Rudi Sayat Pulatyan",
+	"authorUrl": "https://github.com/rudipyan",
 	"isDesktopOnly": false
 }

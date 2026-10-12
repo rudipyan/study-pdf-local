@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
 	classifyPointerGesture,
+	shouldKeepPressForGesture,
 	TAP_MAX_TRAVEL_PX,
 	TAP_MAX_DURATION_MS,
 	type PointerGesture,
@@ -52,5 +53,25 @@ describe('classifyPointerGesture', () => {
 
 	it('rejects a slow drag on both counts', () => {
 		expect(classifyPointerGesture(gesture({ endY: 500, durationMs: 3000 }))).toBe('gesture');
+	});
+
+	it('does not keep a press that followed a scroll gesture for later removal', () => {
+		expect(shouldKeepPressForGesture(gesture({ endY: 260 }))).toBe(false);
+		expect(shouldKeepPressForGesture(gesture())).toBe(true);
+	});
+
+	it('keeps brief pointercancel thumb taps but discards scrolls and long presses', () => {
+		const capturedPress = { annotation: 'original-highlight' };
+		const retainedTarget = (input: PointerGesture) => {
+			const retainedPress = shouldKeepPressForGesture(input) ? capturedPress : null;
+			return retainedPress?.annotation ?? null;
+		};
+
+		// WKWebView can cancel a brief thumb tap; the PDF point was captured at
+		// pointerdown, so retaining it cannot relocate the chosen annotation.
+		expect(retainedTarget(gesture({ endX: 107, endY: 205, durationMs: 120 }))).toBe('original-highlight');
+		// A real scroll or long press must not trigger a later remove action.
+		expect(retainedTarget(gesture({ endY: 260, durationMs: 180 }))).toBeNull();
+		expect(retainedTarget(gesture({ durationMs: 900 }))).toBeNull();
 	});
 });

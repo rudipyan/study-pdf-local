@@ -52,7 +52,7 @@ interface CapturedPage {
 /** Snapshot the visible page canvases and start watching for the reload to
  * complete. Returns null when there's nothing to mask (no rendered pages in
  * view), which callers should treat as "just write the file normally". */
-export function showReloadCurtain(app: App, pdfView: ActivePdfView, paint?: CurtainPaint): ReloadCurtain | null {
+export function showReloadCurtain(app: App, pdfView: ActivePdfView, paint?: CurtainPaint | readonly CurtainPaint[]): ReloadCurtain | null {
 	const doc = pdfView.containerEl.ownerDocument;
 	const win = doc.defaultView ?? window;
 	const file = pdfView.file;
@@ -67,6 +67,10 @@ export function showReloadCurtain(app: App, pdfView: ActivePdfView, paint?: Curt
 		rect: DOMRect;
 	}
 	const visiblePages: VisiblePage[] = [];
+	const paintList: readonly CurtainPaint[] = !paint
+		? []
+		: 'pageNumber' in paint ? [paint] : paint;
+	const paints = new Map(paintList.map((item) => [item.pageNumber, item]));
 	for (const canvas of Array.from(pdfView.containerEl.querySelectorAll<HTMLCanvasElement>('div.page canvas'))) {
 		const rect = canvas.getBoundingClientRect();
 		if (rect.width === 0 || rect.bottom < 0 || rect.top > win.innerHeight) continue;
@@ -89,17 +93,18 @@ export function showReloadCurtain(app: App, pdfView: ActivePdfView, paint?: Curt
 			continue;
 		}
 		ctx.drawImage(canvas, 0, 0);
-		if (paint && paint.pageNumber === pageNumber) {
+		const pagePaint = paints.get(pageNumber);
+		if (pagePaint) {
 			// Multiply blend + fill opacity mirrors how the real annotation's
 			// appearance stream renders, so the painted preview and the final
 			// render are near-indistinguishable when the curtain lifts.
 			const scaleX = canvas.width / rect.width;
 			const scaleY = canvas.height / rect.height;
 			ctx.save();
-			ctx.globalAlpha = paint.opacity;
+			ctx.globalAlpha = pagePaint.opacity;
 			ctx.globalCompositeOperation = 'multiply';
-			ctx.fillStyle = paint.color;
-			for (const r of paint.rects) {
+			ctx.fillStyle = pagePaint.color;
+			for (const r of pagePaint.rects) {
 				ctx.fillRect((r.left - rect.left) * scaleX, (r.top - rect.top) * scaleY, r.width * scaleX, r.height * scaleY);
 			}
 			ctx.restore();

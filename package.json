@@ -1,7 +1,7 @@
 {
-	"name": "study-pdf",
-	"version": "0.4.4",
-	"description": "Highlight text and add notes to PDFs, saved into the file itself so they work in any reader — then browse them all, export them to a note, or turn your notes into spaced-repetition flashcards.",
+	"name": "study-pdf-local",
+	"version": "0.5.0",
+	"description": "Highlight PDFs with custom colors, edit comments, and export annotations and quotations.",
 	"main": "main.js",
 	"type": "module",
 	"scripts": {
@@ -27,5 +27,14 @@
 		"typescript": "^6.0.3",
 		"typescript-eslint": "^8.65.0",
 		"vitest": "^4.1.10"
+	},
+	"author": "Rudi Sayat Pulatyan",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/rudipyan/study-pdf-local.git"
+	},
+	"homepage": "https://github.com/rudipyan/study-pdf-local",
+	"bugs": {
+		"url": "https://github.com/rudipyan/study-pdf-local/issues"
 	}
 }

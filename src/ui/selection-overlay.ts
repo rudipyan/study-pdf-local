@@ -22,7 +22,7 @@ export interface OverlayRect {
 
 export interface SelectionOverlay {
 	/** Replaces whatever is currently painted. An empty list clears it. */
-	update(rects: OverlayRect[]): void;
+	update(rects: OverlayRect[], color?: string): void;
 	/** Removes the overlay element entirely. */
 	destroy(): void;
 }
@@ -73,7 +73,7 @@ function touchesHorizontally(a: OverlayRect, b: OverlayRect): boolean {
 export function createSelectionOverlay(doc: Document): SelectionOverlay {
 	const el = doc.body.createDiv({ cls: 'study-pdf-selection-overlay' });
 	return {
-		update(rects: OverlayRect[]) {
+		update(rects: OverlayRect[], color?: string) {
 			el.empty();
 			for (const rect of normalizeOverlayRects(rects)) {
 				const rectEl = el.createDiv({ cls: 'study-pdf-selection-rect' });
@@ -83,6 +83,7 @@ export function createSelectionOverlay(doc: Document): SelectionOverlay {
 					width: `${rect.width}px`,
 					height: `${rect.height}px`,
 				});
+				if (color) rectEl.style.backgroundColor = color;
 			}
 		},
 		destroy() {
