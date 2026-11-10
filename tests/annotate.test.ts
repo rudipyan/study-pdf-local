@@ -106,6 +106,59 @@ describe('addHighlightAnnotation', () => {
 		).rejects.toThrow(/multiple of 8/);
 	});
 
+	it.each(['direct', 'indirect'] as const)('appends to an existing %s /Annots array', async (storage) => {
+		const doc = await PDFDocument.load(await makeFixturePdfBytes());
+		const annots = doc.context.obj([]);
+		const page = doc.getPage(0);
+		page.node.set(PDFName.of('Annots'), storage === 'indirect' ? doc.context.register(annots) : annots);
+		const seeded = await doc.save();
+		const box = { left: 0, right: 10, top: 10, bottom: 0 };
+
+		const result = await addHighlightAnnotation(seeded, {
+			pageIndex: 0,
+			quadPoints: [0, 10, 10, 10, 0, 0, 10, 0],
+			box,
+			color: YELLOW,
+		});
+
+		const saved = await PDFDocument.load(result);
+		expect(saved.getPage(0).node.lookupMaybe(PDFName.of('Annots'), PDFArray)?.size()).toBe(1);
+	});
+
+	it('rejects a direct dictionary at /Annots before saving over it', async () => {
+		const doc = await PDFDocument.load(await makeFixturePdfBytes());
+		const page = doc.getPage(0);
+		const originalValue = doc.context.obj({ Type: 'Annot', Subtype: 'Link' });
+		page.node.set(PDFName.of('Annots'), originalValue);
+		const save = vi.spyOn(doc, 'save');
+		vi.spyOn(PDFDocument, 'load').mockResolvedValue(doc);
+		const box = { left: 0, right: 10, top: 10, bottom: 0 };
+
+		await expect(addHighlightAnnotation(new Uint8Array([1]), {
+			pageIndex: 0, quadPoints: [0, 10, 10, 10, 0, 0, 10, 0], box, color: YELLOW,
+		})).rejects.toThrow(/unreadable \/Annots array; highlight was not saved/);
+
+		expect(page.node.get(PDFName.of('Annots'))).toBe(originalValue);
+		expect(save).not.toHaveBeenCalled();
+	});
+
+	it('rejects an unresolved indirect /Annots reference without replacing it', async () => {
+		const doc = await PDFDocument.load(await makeFixturePdfBytes());
+		const page = doc.getPage(0);
+		const originalValue = doc.context.nextRef();
+		page.node.set(PDFName.of('Annots'), originalValue);
+		const save = vi.spyOn(doc, 'save');
+		vi.spyOn(PDFDocument, 'load').mockResolvedValue(doc);
+		const box = { left: 0, right: 10, top: 10, bottom: 0 };
+
+		await expect(addHighlightAnnotation(new Uint8Array([1]), {
+			pageIndex: 0, quadPoints: [0, 10, 10, 10, 0, 0, 10, 0], box, color: YELLOW,
+		})).rejects.toThrow(/unreadable \/Annots array; highlight was not saved/);
+
+		expect(page.node.get(PDFName.of('Annots'))).toBe(originalValue);
+		expect(save).not.toHaveBeenCalled();
+	});
+
 	it('produces a PDF whose page has a real, renderable /Highlight annotation (tiny fixture round-trip)', async () => {
 		const bytes = await makeFixturePdfBytes();
 		const box = { left: 50, right: 250, top: 220, bottom: 195 };

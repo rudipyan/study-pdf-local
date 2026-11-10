@@ -1,6 +1,5 @@
-// Reads every /Highlight annotation out of a temporary PDF.js document parsed
-// from the same immutable byte snapshot used for its stored metadata. No need
-// to bundle our own copy of pdf.js.
+// Reads highlights and standalone text notes from a temporary PDF.js document
+// parsed from the same immutable byte snapshot used for its stored metadata.
 //
 // No Obsidian imports -- the pdf.js document is passed in.
 import { quadPointsToRects, extractQuote, normalizeQuote, type PdfJsTextItem } from './pdf-text-extraction';
@@ -13,6 +12,7 @@ export interface HighlightEntry {
 	colorCss: string;
 	quote: string;
 	note: string | null;
+	standaloneNote?: boolean;
 	/** pdf.js annotation id (e.g. "40R") -- the same id Obsidian's own
 	 * `#page=N&annotation=ID` deep links target. */
 	annotationId: string | null;
@@ -25,6 +25,7 @@ export interface HighlightEntry {
 export interface PdfJsAnnotation {
 	subtype?: string;
 	quadPoints?: unknown;
+	rect?: number[];
 	color?: number[];
 	contentsObj?: { str?: string };
 	id?: string;
@@ -70,11 +71,17 @@ export async function collectHighlights(
 		assertScanActive(options.signal);
 		const page = await pdfjsDoc.getPage(pageNumber);
 		const annotations = await page.getAnnotations();
-		const highlights = annotations.filter((a) => a.subtype === 'Highlight');
 		const pageStoredQuotes = storedQuotes.byAnnotationId.get(pageNumber - 1);
 		let textItems: PdfJsTextItem[] | null = null;
-		for (const annotation of highlights) {
+		for (const annotation of annotations) {
 			assertScanActive(options.signal);
+			const note = annotation.contentsObj?.str?.trim() || null;
+			if (annotation.subtype === 'Text' && note) {
+				entries.push({ pageNumber, top: annotation.rect?.[3] ?? 0, colorCss: '', quote: '', note,
+					annotationId: annotation.id ?? null, standaloneNote: true });
+				continue;
+			}
+			if (annotation.subtype !== 'Highlight') continue;
 			const rects = quadPointsToRects(annotation.quadPoints);
 			const metadata = annotation.id ? pageStoredQuotes?.get(annotation.id) : null;
 			const storedQuote = metadata?.quote ?? null;
@@ -98,7 +105,7 @@ export async function collectHighlights(
 				top: rects[0]?.top ?? 0,
 				colorCss: `rgb(${r}, ${g}, ${b})`,
 				quote,
-				note: annotation.contentsObj?.str?.trim() || null,
+				note,
 				annotationId: annotation.id ?? null,
 			});
 		}

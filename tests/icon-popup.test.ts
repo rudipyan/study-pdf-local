@@ -8,20 +8,28 @@ class Element extends EventTarget {
 	constructor(readonly tag = 'div', readonly options: Options = {}) { super(); }
 	children: Element[] = [];
 	attributes = new Map<string, string>();
+	style: Record<string, string> = {};
 	focus = vi.fn();
 	remove = vi.fn();
 	createDiv(options: Options = {}) { return this.createEl('div', options); }
 	createEl(tag: string, options: Options = {}) { const child = new Element(tag, options); this.children.push(child); return child; }
 	createSpan(options: Options = {}) { return this.createEl('span', options); }
+	get textContent() { return [this.options.text ?? '', ...this.children.map((child) => child.textContent)].join(''); }
 	disabled = false;
+	type = '';
+	tabIndex = -1;
 	click() { if (!this.disabled) this.dispatchEvent(new Event('click')); }
 	setCssStyles() {}
 	setAttribute(name: string, value: string) { this.attributes.set(name, value); }
+	getAttribute(name: string) { return this.attributes.get(name) ?? null; }
 	getBoundingClientRect() { return { width: 100, height: 30 }; }
 }
 function documentFixture() {
 	return Object.assign(new EventTarget(), {
-		body: new Element(), defaultView: Object.assign(new EventTarget(), { innerWidth: 800, innerHeight: 600 }),
+		body: new Element(), defaultView: Object.assign(new EventTarget(), {
+			innerWidth: 800, innerHeight: 600,
+			requestAnimationFrame: vi.fn(() => 1), cancelAnimationFrame: vi.fn(),
+		}),
 	}) as unknown as Document;
 }
 describe('selection color popup', () => {
@@ -65,16 +73,25 @@ function descendants(element: Element): Element[] {
 }
 function annotationPopup(candidates: CandidateChoice[] = [candidate]) {
 	const doc = documentFixture();
-	const actions = { onRecolor: vi.fn(), onEditNote: vi.fn(), onRemove: vi.fn() };
+	const actions = { onRecolor: vi.fn(), onEditNote: vi.fn(), onCopy: vi.fn(), onRemove: vi.fn() };
 	const popup = showColorPaletteModal(doc, { x: 10, y: 10 }, candidates, colors, 'blue', actions);
 	const el = popup.el as unknown as Element;
 	return { doc, popup, el, nodes: descendants(el), actions };
 }
 describe('compact annotation actions', () => {
-	it('exposes colors immediately with one note action, a remove circle and no text preview', () => {
+	it('exposes icon-only note and copy actions, colors, and a remove circle without a text preview', () => {
 		const f = annotationPopup();
 		expect(f.nodes.some(node => ['details', 'summary'].includes(node.tag))).toBe(false);
-		expect(f.nodes.filter(node => node.tag === 'button').map(node => node.options.text)).toEqual(['Add note', undefined, undefined, undefined]);
+		const buttons = f.nodes.filter(node => node.tag === 'button');
+		expect(buttons).toHaveLength(5);
+		expect(buttons.map(node => node.getAttribute('aria-label'))).toEqual([
+			'Add note for highlight 1 of 1, page 1: “Quoted passage must not appear in this popup”',
+			'Copy highlighted text for highlight 1 of 1, page 1: “Quoted passage must not appear in this popup”',
+			'Change highlight 1 of 1, page 1: “Quoted passage must not appear in this popup” to Custom blue, default color',
+			'Change highlight 1 of 1, page 1: “Quoted passage must not appear in this popup” to Yellow, current color',
+			'Remove annotation (highlight 1 of 1, page 1: “Quoted passage must not appear in this popup”)',
+		]);
+		expect(buttons.every(node => node.textContent === '')).toBe(true);
 		expect(f.nodes.some(node => node.options.text?.includes(candidate.quote!))).toBe(false);
 		expect(f.nodes.some(node => node.options.text === 'Highlight')).toBe(false);
 		expect(f.nodes.filter(node => node.options.cls === 'study-pdf-annotation-color')).toHaveLength(2);
@@ -95,10 +112,28 @@ describe('compact annotation actions', () => {
 	it('opens an existing comment for editing without displaying it in the toolbar', () => {
 		const withNote = { ...candidate, note: 'Existing comment' };
 		const f = annotationPopup([withNote]);
-		const edit = f.nodes.find(node => node.options.text === 'Edit note')!;
+		const edit = f.nodes.find(node => node.getAttribute('aria-label')?.startsWith('Edit note for '))!;
 		edit.click();
 		expect(f.actions.onEditNote).toHaveBeenCalledExactlyOnceWith(withNote);
 		expect(f.nodes.some(node => node.options.text === withNote.note)).toBe(false);
+		f.popup.hide();
+	});
+	it('copies only the exact annotation selected by its accessible action', () => {
+		const second = { ...candidate, target: { ...candidate.target!, objectNumber: 20 }, quote: 'Second annotation quote' };
+		const f = annotationPopup([candidate, second]);
+		const copy = f.nodes.find(node => node.getAttribute('aria-label')?.startsWith('Copy highlighted text for highlight 2 of 2'))!;
+		expect(copy.textContent).toBe('');
+		copy.click();
+		expect(f.actions.onCopy).toHaveBeenCalledExactlyOnceWith(second);
+		f.popup.hide();
+	});
+	it('offers copy for an imported highlight with text quads and no saved quote', () => {
+		const imported = { ...candidate, quote: null, quoteRects: [{ left: 10, right: 20, bottom: 30, top: 40 }] };
+		const f = annotationPopup([imported]);
+		const copy = f.nodes.find(node => node.getAttribute('aria-label')?.startsWith('Copy highlighted text for '))!;
+		expect(copy.disabled).toBe(false);
+		copy.click();
+		expect(f.actions.onCopy).toHaveBeenCalledExactlyOnceWith(imported);
 		f.popup.hide();
 	});
 	it('keeps note editing available but disables unsupported recoloring', () => {
@@ -108,7 +143,7 @@ describe('compact annotation actions', () => {
 		expect(dots.every(node => node.disabled)).toBe(true);
 		dots[0]!.click();
 		expect(f.actions.onRecolor).not.toHaveBeenCalled();
-		f.nodes.find(node => node.options.text === 'Add note')!.click();
+		f.nodes.find(node => node.getAttribute('aria-label')?.startsWith('Add note for '))!.click();
 		expect(f.actions.onEditNote).toHaveBeenCalledOnce();
 		f.popup.hide();
 	});

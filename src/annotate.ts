@@ -38,6 +38,8 @@ export interface AddHighlightOptions {
 	 * so this is stored in full after whitespace normalization in a custom dict key and preferred over
 	 * geometric reconstruction whenever it's available. */
 	quote?: string;
+	/** A rectangular figure/table selection, copied as an image. */
+	isRegion?: boolean;
 }
 
 const DEFAULT_OPACITY = 1;
@@ -46,8 +48,10 @@ const DEFAULT_OPACITY = 1;
  * ignore dict keys they don't recognize, so this doesn't affect how the
  * highlight itself renders anywhere; only getStoredQuotes reads it back. */
 const QUOTE_KEY = 'StudyPDFQuote';
-/** Read-only compatibility marker for manual region annotations created by
- * earlier plugin versions. New region annotations are no longer created. */
+const SUPPORTED_REPLACEMENT_ANNOTATION_KEYS = new Set([
+	'/Type', '/Subtype', '/Rect', '/QuadPoints', '/C', '/CA', '/F', '/AP', `/${QUOTE_KEY}`,
+]);
+/** Marks image regions so they are not reconstructed as text quotations. */
 const REGION_KEY = 'StudyPDFRegion';
 
 interface LocalRect {
@@ -121,6 +125,17 @@ function buildAppearanceStreamContent(quadPoints: number[], box: PdfBox, color: 
 	return lines.join('\n');
 }
 
+function createHighlightAppearance(context: PDFContext, quadPoints: number[], box: PdfBox, color: RgbColor, opacity: number): PDFRawStream {
+	return context.stream(buildAppearanceStreamContent(quadPoints, box, color), {
+		Type: 'XObject',
+		Subtype: 'Form',
+		FormType: 1,
+		BBox: [0, 0, box.right - box.left, box.top - box.bottom],
+		Matrix: [1, 0, 0, 1, box.left, box.bottom],
+		Resources: { ExtGState: { GS0: { Type: 'ExtGState', ca: opacity, BM: 'Multiply' } } },
+	});
+}
+
 /** Previous Study PDF releases used bounding rectangles in the appearance
  * stream. Accept that exact, generated form for safe recoloring of old marks. */
 function buildLegacyAppearanceStreamContent(quadPoints: number[], box: PdfBox, color: RgbColor): string {
@@ -163,11 +178,20 @@ const COOPERATIVE_SAVE_BYTES = 8 * 1024 * 1024;
 const DEEP_COOPERATIVE_SAVE_BYTES = 32 * 1024 * 1024;
 const COOPERATIVE_OBJECT_COUNT = 5000;
 const DEEP_COOPERATIVE_OBJECT_COUNT = 20000;
+let iosPdfWorkScheduling = false;
+
+/** Enables bounded parser and writer batches for iOS PDF work. */
+export function configurePdfWorkScheduling(isIos: boolean): void {
+	iosPdfWorkScheduling = isIos;
+}
 
 function parseOptionsForBytes(pdfBytes: Uint8Array) {
-	if (pdfBytes.byteLength >= DEEP_COOPERATIVE_PARSE_BYTES) return { parseSpeed: ParseSpeeds.Medium };
-	if (pdfBytes.byteLength >= COOPERATIVE_PARSE_BYTES) return { parseSpeed: ParseSpeeds.Fast };
-	return { parseSpeed: ParseSpeeds.Fastest };
+	const parseSpeed = pdfBytes.byteLength >= DEEP_COOPERATIVE_PARSE_BYTES
+		? ParseSpeeds.Medium
+		: pdfBytes.byteLength >= COOPERATIVE_PARSE_BYTES
+			? ParseSpeeds.Fast
+			: ParseSpeeds.Fastest;
+	return { parseSpeed: iosPdfWorkScheduling ? Math.min(parseSpeed, ParseSpeeds.Medium) : parseSpeed };
 }
 
 async function loadPdfDoc(pdfBytes: Uint8Array): Promise<PDFDocument> {
@@ -226,7 +250,10 @@ function savePdfDoc(pdfDoc: PDFDocument, sourceBytes: Uint8Array): Promise<Uint8
 		: sourceBytes.byteLength >= COOPERATIVE_SAVE_BYTES || objectCount >= COOPERATIVE_OBJECT_COUNT
 			? 1500
 			: Infinity;
-	return pdfDoc.save({ useObjectStreams: false, objectsPerTick });
+	return pdfDoc.save({
+		useObjectStreams: false,
+		objectsPerTick: iosPdfWorkScheduling ? Math.min(objectsPerTick, ParseSpeeds.Medium) : objectsPerTick,
+	});
 }
 
 /** Safety guard shared by every function that saves a modified PDF: pdf-lib fully
@@ -281,6 +308,13 @@ export async function addHighlightAnnotations(
 		if (!Number.isInteger(pageIndex) || pageIndex < 0 || pageIndex >= pdfDoc.getPageCount()) {
 			throw new Error('Study PDF: highlight page does not exist.');
 		}
+		const page = pdfDoc.getPage(pageIndex);
+		const annotsKey = PDFName.of('Annots');
+		const rawAnnotsValue = page.node.get(annotsKey);
+		const existingAnnots = safeDictionaryArray(page.node, annotsKey);
+		if (rawAnnotsValue !== undefined && !existingAnnots) {
+			throw new Error(`Study PDF: page ${pageIndex} has an unreadable /Annots array; highlight was not saved.`);
+		}
 		if (quadPoints.length === 0 || quadPoints.length % 8 !== 0) {
 			throw new Error(`quadPoints must be a non-empty multiple of 8, got ${quadPoints.length}`);
 		}
@@ -289,18 +323,7 @@ export async function addHighlightAnnotations(
 		validateInputQuadPoints(quadPoints, box);
 		const normalizedQuote = normalizeQuote(quote ?? '');
 
-		const width = box.right - box.left;
-		const height = box.top - box.bottom;
-		const apContent = buildAppearanceStreamContent(quadPoints, box, color);
-		const apStream = context.stream(apContent, {
-			Type: 'XObject',
-			Subtype: 'Form',
-			FormType: 1,
-			BBox: [0, 0, width, height],
-			Matrix: [1, 0, 0, 1, box.left, box.bottom],
-			Resources: { ExtGState: { GS0: { Type: 'ExtGState', ca: opacity, BM: 'Multiply' } } },
-		});
-		const apRef = context.register(apStream);
+		const apRef = context.register(createHighlightAppearance(context, quadPoints, box, color, opacity));
 		const highlightDict = context.obj({
 			Type: 'Annot',
 			Subtype: 'Highlight',
@@ -310,11 +333,10 @@ export async function addHighlightAnnotations(
 			CA: opacity,
 			F: 4,
 			AP: { N: apRef },
+			...(options.isRegion ? { [REGION_KEY]: PDFBool.True } : {}),
 			...(normalizedQuote ? { [QUOTE_KEY]: PDFHexString.fromText(normalizedQuote) } : {}),
 		});
 		const annotRef = context.register(highlightDict);
-		const page = pdfDoc.getPage(pageIndex);
-		const existingAnnots = safeDictionaryArray(page.node, PDFName.of('Annots'));
 		const currentCount = expectedCounts.get(pageIndex) ?? existingAnnots?.size() ?? 0;
 		expectedCounts.set(pageIndex, currentCount + 1);
 		const annots = existingAnnots ?? context.obj([]);
@@ -332,6 +354,215 @@ export async function addHighlightAnnotations(
 		const actualCount = verifyAnnots?.size() ?? 0;
 		if (actualCount !== expectedAnnotCount) {
 			throw new Error(`Study PDF: annotation count on page ${pageIndex} is ${actualCount}, expected ${expectedAnnotCount}; aborting to avoid corrupting the file.`);
+		}
+	}
+	const fingerprint = await fingerprintPdfBytes(savedBytes);
+	rememberVerifiedHighlightState(savedBytes, verifyDoc, fingerprint);
+	return savedBytes;
+}
+
+interface ValidatedReplacementHighlight {
+	options: AddHighlightOptions;
+	opacity: number;
+	quote: string;
+	polygons: QuadPolygon[];
+}
+
+interface ReplacementPagePlan {
+	page: ReturnType<PDFDocument['getPage']>;
+	originalAnnots: ReturnType<PDFArray['get']>[];
+	removals: Set<string>;
+	additions: PDFRef[];
+	expectedAnnots: ReturnType<PDFArray['get']>[];
+}
+
+function replacementMetadataReason(context: PDFContext, dict: PDFDict): string | null {
+	const unexpectedKeys = dict.keys()
+		.map((key) => key.toString())
+		.filter((key) => !SUPPORTED_REPLACEMENT_ANNOTATION_KEYS.has(key));
+	if (unexpectedKeys.length > 0) {
+		return `This highlight has metadata the replacement cannot preserve safely (${unexpectedKeys.join(', ')}).`;
+	}
+	if (dict.get(PDFName.of('Type'))?.toString() !== '/Annot') return 'This highlight has an unsupported annotation type marker.';
+	const flags = safeContextNumber(context, dict.get(PDFName.of('F')));
+	if (flags !== 4) return 'This highlight has unsupported annotation flags.';
+	const quoteValue = dict.get(PDFName.of(QUOTE_KEY));
+	if (quoteValue !== undefined && readNote(dict, QUOTE_KEY) === null) return 'This highlight has an unsupported stored quote value.';
+	try {
+		metadataSignature(dict);
+	} catch {
+		return 'This highlight has metadata that cannot be verified safely.';
+	}
+	return null;
+}
+
+/** Adds new highlights while replacing only existing, fully supported highlights
+ * whose actual QuadPoints polygons have a positive-area intersection with one
+ * of the new selections. All overlap decisions use the original /Annots arrays,
+ * so new highlights in a cross-page operation never remove one another. */
+export async function replaceOverlappingHighlightAnnotations(
+	pdfBytes: Uint8Array,
+	optionsList: readonly AddHighlightOptions[],
+): Promise<Uint8Array> {
+	if (optionsList.length === 0) throw new Error('Study PDF: at least one highlight is required.');
+	const pdfDoc = await loadPdfDoc(pdfBytes);
+	const context = pdfDoc.context;
+	const validated: ValidatedReplacementHighlight[] = [];
+	const optionsByPage = new Map<number, ValidatedReplacementHighlight[]>();
+	const pagePlans = new Map<number, ReplacementPagePlan>();
+
+	// Validate every incoming selection before planning any removals or changing
+	// the document, matching addHighlightAnnotations' input contract.
+	for (const options of optionsList) {
+		const { pageIndex, quadPoints, box, color, opacity = DEFAULT_OPACITY, quote } = options;
+		if (!Number.isInteger(pageIndex) || pageIndex < 0 || pageIndex >= pdfDoc.getPageCount()) {
+			throw new Error('Study PDF: highlight page does not exist.');
+		}
+		if (quadPoints.length === 0 || quadPoints.length % 8 !== 0) {
+			throw new Error(`quadPoints must be a non-empty multiple of 8, got ${quadPoints.length}`);
+		}
+		if (!isValidRgbColor(color)) throw new Error('Study PDF: highlight color must contain finite RGB channels between 0 and 1.');
+		if (!Number.isFinite(opacity) || opacity < 0 || opacity > 1) throw new Error('Study PDF: highlight opacity must be between 0 and 1.');
+		validateInputQuadPoints(quadPoints, box);
+		const parsed = parseQuadPolygons(quadPoints, box);
+		if (!parsed.valid) throw new Error(`Study PDF: ${parsed.reason}`);
+		const replacement: ValidatedReplacementHighlight = {
+			options,
+			opacity,
+			quote: normalizeQuote(quote ?? ''),
+			polygons: parsed.polygons,
+		};
+		validated.push(replacement);
+		const pageOptions = optionsByPage.get(pageIndex) ?? [];
+		pageOptions.push(replacement);
+		optionsByPage.set(pageIndex, pageOptions);
+	}
+
+	// Snapshot each touched page's original annotation membership and decide all
+	// removals before registering any new annotations.
+	for (const [pageIndex, pageOptions] of optionsByPage) {
+		const page = pdfDoc.getPage(pageIndex);
+		const annotsValue = page.node.get(PDFName.of('Annots'));
+		const originalArray = safeDictionaryArray(page.node, PDFName.of('Annots'));
+		if (annotsValue !== undefined && !originalArray) {
+			throw new Error(`Study PDF: page ${pageIndex} has an unreadable /Annots array; replacement was not saved.`);
+		}
+		const originalAnnots = originalArray ? [...originalArray.asArray()] : [];
+		const plan: ReplacementPagePlan = {
+			page,
+			originalAnnots,
+			removals: new Set(),
+			additions: [],
+			expectedAnnots: [],
+		};
+		pagePlans.set(pageIndex, plan);
+
+		const referenceCounts = new Map<string, number>();
+		for (const value of originalAnnots) {
+			if (value instanceof PDFRef) referenceCounts.set(value.toString(), (referenceCounts.get(value.toString()) ?? 0) + 1);
+		}
+
+		for (const value of originalAnnots) {
+			const dict = safeContextDict(context, value);
+			if (!dict || dict.get(PDFName.of('Subtype'))?.toString() !== '/Highlight') continue;
+			// A figure/table region has independent image semantics. Text selections
+			// replace text highlights only; they must neither delete nor split regions.
+			if (dict.get(PDFName.of(REGION_KEY)) === PDFBool.True) continue;
+			const geometry = readHighlightGeometry(context, value);
+			if (!geometry) {
+				throw new Error(`Study PDF: page ${pageIndex} has a /Highlight without usable /Rect geometry; replacement was not saved because overlap cannot be determined safely.`);
+			}
+
+			if (geometry.invalidReason) {
+				if (pageOptions.some(({ options }) => boxesOverlap(geometry.box, options.box))) {
+					throw new Error(`Study PDF: an existing /Highlight may overlap the new selection, but its geometry is invalid (${geometry.invalidReason}); replacement was not saved.`);
+				}
+				continue;
+			}
+
+			const overlaps = pageOptions.some(({ options, polygons }) => boxesOverlap(geometry.box, options.box) &&
+				geometry.polygons.some((existing) => polygons.some((incoming) => polygonsHavePositiveAreaIntersection(existing, incoming))));
+			if (!overlaps) continue;
+
+			if (!(value instanceof PDFRef)) {
+				throw new Error('Study PDF: an overlapping /Highlight is a direct annotation with no stable reference; replacement was not saved.');
+			}
+			if (referenceCounts.get(value.toString()) !== 1) {
+				throw new Error('Study PDF: an overlapping /Highlight has an ambiguous annotation reference; replacement was not saved.');
+			}
+			if (dict.get(PDFName.of('Contents')) !== undefined || dict.get(PDFName.of('RC')) !== undefined) {
+				throw new Error('Study PDF: an overlapping highlight contains a note or rich-text comment. Replacement was not saved so the note is preserved.');
+			}
+			const unsupportedReason = getUnsupportedReason(context, value, geometry, dict, 'overlap') ?? replacementMetadataReason(context, dict);
+			if (unsupportedReason) {
+				throw new Error(`Study PDF: an overlapping highlight cannot be replaced safely: ${unsupportedReason} The PDF was not changed.`);
+			}
+			plan.removals.add(value.toString());
+		}
+	}
+
+	const addedAnnotations: { ref: PDFRef; replacement: ValidatedReplacementHighlight }[] = [];
+	for (const replacement of validated) {
+		const { options, opacity, quote } = replacement;
+		const { pageIndex, quadPoints, box, color } = options;
+		const apRef = context.register(createHighlightAppearance(context, quadPoints, box, color, opacity));
+		const highlightDict = context.obj({
+			Type: 'Annot',
+			Subtype: 'Highlight',
+			Rect: [box.left, box.bottom, box.right, box.top],
+			QuadPoints: quadPoints,
+			C: [color.r, color.g, color.b],
+			CA: opacity,
+			F: 4,
+			AP: { N: apRef },
+			...(quote ? { [QUOTE_KEY]: PDFHexString.fromText(quote) } : {}),
+		});
+		const ref = context.register(highlightDict);
+		pagePlans.get(pageIndex)!.additions.push(ref);
+		addedAnnotations.push({ ref, replacement });
+	}
+
+	for (const plan of pagePlans.values()) {
+		const keptAnnots = plan.originalAnnots.filter((value) => !(value instanceof PDFRef && plan.removals.has(value.toString())));
+		plan.expectedAnnots = [...keptAnnots, ...plan.additions];
+		const annots = PDFArray.withContext(context);
+		for (const value of plan.expectedAnnots) annots.push(value);
+		plan.page.node.set(PDFName.of('Annots'), annots);
+	}
+
+	const savedBytes = await savePdfDoc(pdfDoc, pdfBytes);
+	const verifyDoc = await PDFDocument.load(savedBytes, parseOptionsForBytes(savedBytes));
+	if (verifyDoc.getPageCount() !== pdfDoc.getPageCount()) {
+		throw new Error('Study PDF: page count changed after saving; aborting to avoid corrupting the file.');
+	}
+	for (const [pageIndex, plan] of pagePlans) {
+		const verifyAnnots = safeDictionaryArray(verifyDoc.getPage(pageIndex).node, PDFName.of('Annots'));
+		const actual = verifyAnnots ? verifyAnnots.asArray() : [];
+		if (JSON.stringify(actual.map(canonicalPdfValue)) !== JSON.stringify(plan.expectedAnnots.map(canonicalPdfValue))) {
+			throw new Error(`Study PDF: annotation membership or order changed on page ${pageIndex} after saving; aborting to avoid corrupting the file.`);
+		}
+	}
+	for (const { ref, replacement } of addedAnnotations) {
+		const { options, quote } = replacement;
+		const verifyAnnots = safeDictionaryArray(verifyDoc.getPage(options.pageIndex).node, PDFName.of('Annots'));
+		const verifyRef = verifyAnnots?.asArray().find((value) => value instanceof PDFRef && sameRef(value, ref));
+		if (!(verifyRef instanceof PDFRef)) throw new Error('Study PDF: a new highlight reference is missing after saving.');
+		const dict = verifyDoc.context.lookup(verifyRef, PDFDict);
+		const geometry = readHighlightGeometry(verifyDoc.context, verifyRef);
+		if (dict.get(PDFName.of('Subtype'))?.toString() !== '/Highlight' || !geometry || geometry.invalidReason ||
+			!numericArrayMatches(verifyDoc.context, dict.get(PDFName.of('Rect')), [options.box.left, options.box.bottom, options.box.right, options.box.top]) ||
+			!numericArrayMatches(verifyDoc.context, dict.get(PDFName.of('QuadPoints')), options.quadPoints) ||
+			!sameColor(readRgbColor(verifyDoc.context, dict), options.color) ||
+			(quote ? readNote(dict, QUOTE_KEY) !== quote : dict.get(PDFName.of(QUOTE_KEY)) !== undefined)) {
+			throw new Error('Study PDF: new highlight geometry, color, or stored quote did not verify after saving.');
+		}
+		const appearance = checkRecolorAppearance(verifyDoc.context, dict, geometry, options.quadPoints, options.color);
+		const annotationOpacity = safeContextNumber(verifyDoc.context, dict.get(PDFName.of('CA')));
+		if (appearance.reason || !appearance.graphicsState || annotationOpacity === undefined ||
+			Math.abs(annotationOpacity - replacement.opacity) >= 1e-8 ||
+			Math.abs(appearance.graphicsState.ca - replacement.opacity) >= 1e-8 ||
+			appearance.graphicsState.blendMode !== '/Multiply') {
+			throw new Error('Study PDF: new highlight appearance or opacity did not verify after saving.');
 		}
 	}
 	const fingerprint = await fingerprintPdfBytes(savedBytes);
@@ -438,6 +669,34 @@ function parseQuadPolygons(raw: number[], box: PdfBox): { valid: true; polygons:
 	return { valid: true, polygons };
 }
 
+/** Tests actual convex polygon intersection, excluding edge-only contact. */
+function polygonsHavePositiveAreaIntersection(first: QuadPolygon, second: QuadPolygon): boolean {
+	for (const polygon of [first, second]) {
+		for (let index = 0; index < polygon.points.length; index++) {
+			const start = polygon.points[index]!;
+			const end = polygon.points[(index + 1) % polygon.points.length]!;
+			const axisX = start.y - end.y;
+			const axisY = end.x - start.x;
+			let firstMin = Infinity;
+			let firstMax = -Infinity;
+			let secondMin = Infinity;
+			let secondMax = -Infinity;
+			for (const point of first.points) {
+				const projection = point.x * axisX + point.y * axisY;
+				firstMin = Math.min(firstMin, projection);
+				firstMax = Math.max(firstMax, projection);
+			}
+			for (const point of second.points) {
+				const projection = point.x * axisX + point.y * axisY;
+				secondMin = Math.min(secondMin, projection);
+				secondMax = Math.max(secondMax, projection);
+			}
+			if (firstMax <= secondMin || secondMax <= firstMin) return false;
+		}
+	}
+	return true;
+}
+
 /** The geometry of a /Highlight annotation, or null if the ref isn't one (or
  * has no /Rect). */
 function readHighlightGeometry(context: PDFContext, ref: ReturnType<PDFArray['get']>): HighlightGeometry | null {
@@ -531,8 +790,12 @@ export interface HighlightInfo {
 	/** Exact indirect object identity bound to these source bytes, absent for direct dictionaries. */
 	target: HighlightTarget | null;
 	quote: string | null;
+	/** PDF-space text quads for recovering an imported highlight's quote. */
+	quoteRects?: readonly PdfBox[];
 	currentColor: RgbColor | null;
 	unsupportedReason: string | null;
+	/** PDF-space bounds of an explicitly marked image region. */
+	regionBox?: PdfBox;
 }
 
 /** Reads a string-valued dict entry (by key name), handling both string
@@ -582,6 +845,7 @@ interface AppearanceCheck {
 	normalValue: ReturnType<PDFDict['get']>;
 	graphicsState: { ca: number; blendMode: string } | null;
 	style: 'polygon' | 'legacy-rectangles' | null;
+	filteredReplacementOpacity?: number;
 }
 
 /** Only recolor the small, known appearance form used by Study PDF. Arbitrary
@@ -625,7 +889,17 @@ function checkRecolorAppearance(
 	if (!(streamObject instanceof PDFRawStream)) return unsupported('This highlight does not use a supported normal appearance stream.');
 	const stream = streamObject;
 	const streamDict = stream.dict;
-	if (streamDict.get(PDFName.of('Filter')) || streamDict.get(PDFName.of('DecodeParms'))) return unsupported('This highlight uses a filtered appearance stream.');
+	const filter = streamDict.get(PDFName.of('Filter'));
+	if (filter || streamDict.get(PDFName.of('DecodeParms'))) {
+		const filtered = unsupported('This highlight uses a filtered appearance stream.');
+		if (!filter || streamDict.get(PDFName.of('Subtype'))?.toString() !== '/Form' || !dictionaryKeysEqual(ap, ['/N'])) return filtered;
+		return {
+			...filtered,
+			appearanceDict: ap,
+			normalValue,
+			filteredReplacementOpacity: annotationOpacity ?? DEFAULT_OPACITY,
+		};
+	}
 	if (!dictionaryKeysEqual(streamDict, ['/Length', '/Type', '/Subtype', '/FormType', '/BBox', '/Matrix', '/Resources'])) {
 		return unsupported('This highlight appearance has unsupported form graphics state.');
 	}
@@ -694,31 +968,43 @@ function targetForAnnotation(
 		: null;
 }
 
-function getUnsupportedReason(context: PDFContext, ref: ReturnType<PDFArray['get']>, geometry: HighlightGeometry, dict: PDFDict): string | null {
+function getUnsupportedReason(
+	context: PDFContext,
+	ref: ReturnType<PDFArray['get']>,
+	geometry: HighlightGeometry,
+	dict: PDFDict,
+	operation: 'recolor' | 'overlap',
+): string | null {
 	if (!(ref instanceof PDFRef)) return 'This direct annotation has no stable indirect reference and cannot be recolored.';
 	if (geometry.invalidReason) return geometry.invalidReason;
 	const color = readRgbColor(context, dict);
 	if (!color) return 'This highlight has no valid /C RGB color.';
 	const quadPoints = readQuadPoints(context, dict);
 	if (!quadPoints) return 'This highlight has malformed /QuadPoints.';
-	return checkRecolorAppearance(context, dict, geometry, quadPoints, color).reason;
+	const appearance = checkRecolorAppearance(context, dict, geometry, quadPoints, color);
+	if (operation === 'recolor' && appearance.filteredReplacementOpacity !== undefined) return null;
+	return appearance.reason;
 }
 
 function makeHighlightInfo(context: PDFContext, pageIndex: number, ref: ReturnType<PDFArray['get']>, geometry: HighlightGeometry, dict: PDFDict, sourceFingerprint: string): HighlightInfo {
 	return {
+		...(dict.get(PDFName.of(REGION_KEY)) === PDFBool.True ? { regionBox: geometry.box } : {}),
 		note: readNote(dict),
 		target: targetForAnnotation(pageIndex, ref, sourceFingerprint, geometry),
 		quote: readNote(dict, QUOTE_KEY),
+		...(geometry.invalidReason === null ? { quoteRects: geometry.quads } : {}),
 		currentColor: readRgbColor(context, dict),
-		unsupportedReason: getUnsupportedReason(context, ref, geometry, dict),
+		unsupportedReason: getUnsupportedReason(context, ref, geometry, dict, 'recolor'),
 	};
 }
 
 function indexedInfo(highlight: IndexedHighlight): HighlightInfo {
 	return {
+		regionBox: highlight.regionBox,
 		note: highlight.note,
 		target: highlight.target,
 		quote: highlight.quote,
+		...(highlight.quoteRects ? { quoteRects: highlight.quoteRects } : {}),
 		currentColor: highlight.currentColor,
 		unsupportedReason: highlight.unsupportedReason,
 	};
@@ -753,14 +1039,9 @@ export async function inspectHighlightAt(
 
 /** Every /Highlight annotation on a page, in /Annots order, reduced to just
  * what a click lookup needs. */
-export interface IndexedHighlight {
+export interface IndexedHighlight extends HighlightInfo {
 	/** The same geometry isOverlappingHighlight compares against. */
 	geometry: HighlightGeometry;
-	note: string | null;
-	target: HighlightInfo['target'];
-	quote: string | null;
-	currentColor: RgbColor | null;
-	unsupportedReason: string | null;
 	/** Original position in the page's /Annots array, used for stable ties. */
 	annotsOrder: number;
 }
@@ -1082,18 +1363,14 @@ function isReferencedOutsideObject(context: PDFContext, target: PDFRef): boolean
 	return false;
 }
 
-function replaceAppearanceColor(
+function recolorAppearanceStream(
 	context: PDFContext,
-	dict: PDFDict,
 	appearance: AppearanceCheck,
 	quadPoints: number[],
 	box: PdfBox,
 	color: RgbColor,
-): void {
-	const ap = appearance.appearanceDict!;
+): PDFRawStream {
 	const originalStream = appearance.stream!;
-	const originalAppearanceRef = appearance.appearanceValue instanceof PDFRef ? appearance.appearanceValue : null;
-	const originalStreamRef = appearance.normalValue instanceof PDFRef ? appearance.normalValue : null;
 	const streamDict = originalStream.dict.clone(context);
 
 	// Rebuild these three nested resource dictionaries before attaching the new
@@ -1113,9 +1390,14 @@ function replaceAppearanceColor(
 		: buildAppearanceStreamContent(quadPoints, box, color);
 	const encoded = encodeAppearanceContent(content);
 	streamDict.set(PDFName.of('Length'), PDFNumber.of(encoded.length));
-	const newStreamRef = context.register(PDFRawStream.of(streamDict, encoded));
-	const apClone = ap.clone(context);
-	apClone.set(PDFName.of('N'), newStreamRef);
+	return PDFRawStream.of(streamDict, encoded);
+}
+
+function replaceNormalAppearance(context: PDFContext, dict: PDFDict, appearance: AppearanceCheck, stream: PDFRawStream): void {
+	const originalAppearanceRef = appearance.appearanceValue instanceof PDFRef ? appearance.appearanceValue : null;
+	const originalStreamRef = appearance.normalValue instanceof PDFRef ? appearance.normalValue : null;
+	const apClone = appearance.appearanceDict!.clone(context);
+	apClone.set(PDFName.of('N'), context.register(stream));
 	// Store the cloned AP dictionary directly. This preserves any shared AP for
 	// other annotations and avoids leaving one new indirect AP dictionary per
 	// recolor in the document.
@@ -1124,9 +1406,8 @@ function replaceAppearanceColor(
 	if (originalStreamRef && !isReferencedOutsideObject(context, originalStreamRef)) context.delete(originalStreamRef);
 }
 
-/** Recolors one exact, indirect /Highlight annotation. Direct dictionaries,
- * stale refs, unsupported appearance programs, and malformed geometry fail
- * before any caller can write the returned bytes. */
+/** Recolors one exact, indirect /Highlight annotation. Rebuilds a filtered
+ * normal form from verified geometry when needed. */
 export async function setHighlightColorAt(
 	pdfBytes: Uint8Array,
 	options: SetHighlightColorOptions,
@@ -1167,16 +1448,28 @@ export async function setHighlightColorAt(
 	const currentColor = readRgbColor(context, dict);
 	if (!currentColor) throw new Error('Study PDF: highlight target has no valid /C RGB color.');
 	const appearance = checkRecolorAppearance(context, dict, geometry, quadPoints, currentColor);
-	if (appearance.reason) throw new Error(`Study PDF: ${appearance.reason}`);
-	const expectedGraphicsState = appearance.graphicsState!;
-	const expectedAppearanceStyle = appearance.style;
-	if (sameColor(currentColor, color)) return { bytes: pdfBytes, updatedCount: 0, target: { pageIndex, objectNumber, generationNumber, sourceFingerprint } };
+	const replacementOpacity = appearance.filteredReplacementOpacity;
+	if (appearance.reason && replacementOpacity === undefined) throw new Error(`Study PDF: ${appearance.reason}`);
+	if (sameColor(currentColor, color)) {
+		return { bytes: pdfBytes, updatedCount: 0, target: { pageIndex, objectNumber, generationNumber, sourceFingerprint } };
+	}
+	if (replacementOpacity !== undefined && pdfDoc.getPages().some((otherPage, index) =>
+		index !== pageIndex && safeDictionaryArray(otherPage.node, PDFName.of('Annots'))?.asArray()
+			.some((value) => value instanceof PDFRef && sameRef(value, targetRef)),
+	)) {
+		throw new Error('Study PDF: this highlight reference is shared across pages.');
+	}
 
+	const expectedGraphicsState = replacementOpacity === undefined ? appearance.graphicsState! : { ca: replacementOpacity, blendMode: '/Multiply' };
+	const expectedAppearanceStyle = replacementOpacity === undefined ? appearance.style : 'polygon';
 	const expectedPageCount = pdfDoc.getPageCount();
 	const expectedOrder = pageAnnotationOrder(pdfDoc);
 	const expectedMetadata = metadataSignature(dict);
+	const stream = replacementOpacity === undefined
+		? recolorAppearanceStream(context, appearance, quadPoints, geometry.box, color)
+		: createHighlightAppearance(context, quadPoints, geometry.box, color, replacementOpacity);
 	dict.set(PDFName.of('C'), context.obj([color.r, color.g, color.b]));
-	replaceAppearanceColor(context, dict, appearance, quadPoints, geometry.box, color);
+	replaceNormalAppearance(context, dict, appearance, stream);
 	const savedBytes = await savePdfDoc(pdfDoc, pdfBytes);
 	const verifyDoc = await PDFDocument.load(savedBytes, parseOptionsForBytes(savedBytes));
 	if (verifyDoc.getPageCount() !== expectedPageCount) throw new Error('Study PDF: page count changed while recoloring; aborting the save.');
@@ -1221,6 +1514,55 @@ interface TargetAnnotationLocation {
 	annotationIndex: number;
 	ref: PDFRef;
 	dict: PDFDict;
+}
+
+/** Add a standard PDF sticky note at a point on the displayed page. */
+export async function addPageNote(
+	pdfBytes: Uint8Array,
+	{ pageIndex, point, note }: { pageIndex: number; point: PdfPoint; note: string },
+): Promise<Uint8Array> {
+	const contents = note.trim();
+	if (!contents || !Number.isFinite(point.x) || !Number.isFinite(point.y)) {
+		throw new Error('Study PDF: a page note needs text and a valid page location.');
+	}
+	const doc = await loadPdfDoc(pdfBytes);
+	const pageCount = doc.getPageCount();
+	if (!Number.isInteger(pageIndex) || pageIndex < 0 || pageIndex >= pageCount) {
+		throw new Error('Study PDF: the note page does not exist.');
+	}
+	const page = doc.getPage(pageIndex);
+	const key = PDFName.of('Annots');
+	const existing = safeDictionaryArray(page.node, key);
+	if (page.node.get(key) !== undefined && !existing) {
+		throw new Error('Study PDF: the page has an unreadable /Annots array.');
+	}
+	const { x, y, width, height } = page.getCropBox();
+	if (![x, y, width, height].every(Number.isFinite) || width <= 0 || height <= 0) {
+		throw new Error('Study PDF: the note page has invalid bounds.');
+	}
+	// PDF.js normalizes Text annotation icons to a 22-point square.
+	const size = Math.min(22, width, height);
+	const left = Math.max(x, Math.min(point.x - size / 2, x + width - size));
+	const bottom = Math.max(y, Math.min(point.y - size / 2, y + height - size));
+	const rect = [left, bottom, left + size, bottom + size];
+	const ref = doc.context.register(doc.context.obj({
+		Type: 'Annot', Subtype: 'Text', Name: 'Comment', Rect: rect,
+		Contents: PDFHexString.fromText(contents), C: [1, 0.85, 0.35], Open: false, F: 4,
+	}));
+	const annots = PDFArray.withContext(doc.context);
+	for (const item of existing?.asArray() ?? []) annots.push(item);
+	annots.push(ref);
+	page.node.set(key, annots);
+	const order = pageAnnotationOrder(doc);
+	const saved = await savePdfDoc(doc, pdfBytes);
+	const verified = await verifySavedBytes(saved, pageCount, pageIndex, annots.size());
+	const dict = safeContextDict(verified.context, ref);
+	if (JSON.stringify(pageAnnotationOrder(verified)) !== JSON.stringify(order) || !dict ||
+		dict.get(PDFName.of('Subtype'))?.toString() !== '/Text' || readNote(dict) !== contents ||
+		!numericArrayMatches(verified.context, dict.get(PDFName.of('Rect')), rect)) {
+		throw new Error('Study PDF: the saved page note or annotation order could not be verified.');
+	}
+	return saved;
 }
 
 async function loadExactHighlightTarget(

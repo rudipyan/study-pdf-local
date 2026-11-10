@@ -49,6 +49,10 @@ class FakeElement {
 		return this.createChild(tagName, options);
 	}
 
+	createSpan(options: FakeOptions = {}): FakeElement {
+		return this.createChild('span', options);
+	}
+
 	private createChild(tagName: string, options: FakeOptions): FakeElement {
 		const child = tagName === 'input'
 			? new FakeInput(this.ownerDocument, tagName)

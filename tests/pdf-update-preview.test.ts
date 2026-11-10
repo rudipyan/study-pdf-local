@@ -103,6 +103,28 @@ describe('pending PDF update preview', () => {
 		expect(f.task.destroy).not.toHaveBeenCalled();
 		expect(f.parent.append).not.toHaveBeenCalled();
 	});
+	it('exposes only the completed overlay from the adopted page proxy', async () => {
+		const f = fixture();
+		const handle = startPdfUpdatePreview(() => f.task, () => f.view, [0], () => true, f.onReady);
+		await f.didStart;
+		f.finish();
+		await f.didShow;
+		expect(await handle.takeDocument!()).toBe(f.task);
+		expect(handle.getRaster?.(0, f.view, f.page)).toBe(f.overlay);
+		expect(handle.getRaster?.(0, f.view, { rotate: 0 })).toBeNull();
+		handle.dispose();
+	});
+	it('declines raster reuse when the isolated preview annotation map has form canvases', async () => {
+		const f = fixture();
+		const handle = startPdfUpdatePreview(() => f.task, () => f.view, [0], () => true, f.onReady);
+		await f.didStart;
+		(f.page.render.mock.calls[0]![0].annotationCanvasMap as Map<unknown, unknown>).set('form-field', {});
+		f.finish();
+		await f.didShow;
+		expect(await handle.takeDocument!()).toBe(f.task);
+		expect(handle.getRaster?.(0, f.view, f.page)).toBeNull();
+		handle.dispose();
+	});
 	it('cannot adopt a document after disposal while its loading promise is pending', async () => {
 		let resolve!: (document: { numPages: number; getPage(): Promise<{ rotate: number }> }) => void;
 		const task = { promise: new Promise<{ numPages: number; getPage(): Promise<{ rotate: number }> }>(r => { resolve = r; }), destroy: vi.fn(async () => {}) };

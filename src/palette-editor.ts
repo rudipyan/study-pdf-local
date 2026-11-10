@@ -276,7 +276,7 @@ export class PaletteEditorSession {
 		nameInput.value = this.nameDrafts.get(color.id) ?? color.name;
 		nameInput.setAttribute('data-palette-focus-key', `palette:name:${color.id}`);
 		nameInput.setAttribute('aria-label', `Name for ${color.name}`);
-		const nameError = nameField.createEl('span', { cls: 'study-pdf-palette-error', attr: { role: 'alert' } });
+			const nameError = nameField.createSpan({ cls: 'study-pdf-palette-error', attr: { role: 'alert' } });
 		const updateNameError = () => {
 			const name = nameInput.value.trim();
 			const error = getPaletteNameError(this.draft, color.id, name);
@@ -318,7 +318,7 @@ export class PaletteEditorSession {
 			this.updateHexDraft(color.id, hex);
 			void this.commitHexDraft(color.id, hex);
 		});
-		const hexError = hexField.createEl('span', { cls: 'study-pdf-palette-error', attr: { role: 'alert' } });
+			const hexError = hexField.createSpan({ cls: 'study-pdf-palette-error', attr: { role: 'alert' } });
 		const updateHexError = () => {
 			const valid = isValidHexDraft(hexInput.value);
 			hexInput.setAttribute('aria-invalid', String(!valid));
@@ -343,7 +343,7 @@ export class PaletteEditorSession {
 
 		const actions = row.createDiv({ cls: 'study-pdf-palette-actions' });
 		if (this.draft.defaultColorId === color.id) {
-			actions.createEl('span', { cls: 'study-pdf-default-indicator', text: 'Default color' });
+			actions.createSpan({ cls: 'study-pdf-default-indicator', text: 'Default color' });
 		} else {
 			const setDefault = actions.createEl('button', { text: 'Set as default' });
 			setDefault.type = 'button';

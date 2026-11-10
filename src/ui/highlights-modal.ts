@@ -1,18 +1,20 @@
 // "Show all highlights and notes": a native Obsidian Modal listing every
-// /Highlight annotation in the open PDF -- color dot, the highlighted text
+// highlight and standalone note in the open PDF -- color dot, the highlighted text
 // (recovered by matching the annotation's QuadPoints against the page's text
 // items), the note if any, and the page number. Clicking a row jumps there.
 //
 // UI glue only: the reading of the live pdf.js document lives in
 // pdf-highlights.ts and the Markdown shapes in highlight-export.ts, both shared
 // with the "Export highlights to note" command.
-import { Modal, Notice, setIcon, setTooltip, type App } from 'obsidian';
+import { Modal, Notice, setTooltip, type App } from 'obsidian';
 import { getAllPdfViews, type ActivePdfView } from '../obsidian-pdf-internals';
 import { capturePdfTarget, isCapturedPdfCurrent, isCapturedPdfViewLive, type CapturedPdfTarget, type PdfMutationCoordinator } from '../pdf-mutation';
 import { withPdfHighlightSnapshot } from '../pdf-highlight-snapshot';
 import { excerptQuote } from '../pdf-text-extraction';
 import type { HighlightEntry } from '../pdf-highlights';
-import { buildEntryLink, formatQuoteBlock } from '../highlight-export';
+import { formatQuoteBlock } from '../highlight-export';
+import { collectHighlightColors, filterHighlightsByColor } from './highlight-color-filter';
+import { renderNoteMarkdown } from './note-markdown';
 
 export class HighlightListModal extends Modal {
 	private readonly pdfView: ActivePdfView;
@@ -95,17 +97,9 @@ export class HighlightListModal extends Modal {
 		}
 	}
 
-	/** Markdown where the quoted text itself IS the deep link: clicking it in a
-	 * note reopens the PDF at this exact annotation. Note follows, if any. */
-	private formatEntryAsLink(entry: HighlightEntry): string {
-		const link = buildEntryLink(entry, (subpath, alias) =>
-			this.app.fileManager.generateMarkdownLink(this.pdfView.file, '', subpath, alias),
-		);
-		return formatQuoteBlock(link, entry.note);
-	}
-
 	/** Plain Markdown: just the quoted text and the note, no link. */
 	private formatEntryText(entry: HighlightEntry): string {
+		if (entry.standaloneNote) return entry.note ?? '';
 		return formatQuoteBlock(entry.quote || '(no text)', entry.note);
 	}
 
@@ -113,109 +107,115 @@ export class HighlightListModal extends Modal {
 		const { contentEl } = this;
 		contentEl.empty();
 		if (entries.length === 0) {
-			contentEl.setText('No highlights in this PDF.');
+			contentEl.setText('No highlights or notes in this PDF.');
 			return;
 		}
 
 		const toolbar = contentEl.createDiv({ cls: 'study-pdf-list-toolbar' });
-		const selectedIndexes = new Set<number>();
-		const selectedEntries = () => entries.filter((_entry, index) => selectedIndexes.has(index));
-		const selectedCopyLinks = toolbar.createEl('button', { text: 'Copy selected links' });
-		const selectedCopyText = toolbar.createEl('button', { text: 'Copy selected text' });
-		const selectedExport = toolbar.createEl('button', { text: 'Export selection' });
-		const updateSelectedActions = () => {
-			const disabled = selectedIndexes.size === 0;
-			selectedCopyLinks.disabled = disabled;
-			selectedCopyText.disabled = disabled;
-			selectedExport.disabled = disabled;
+		const selectedColors = new Set<string>();
+		const highlights = entries.filter((entry) => !entry.standaloneNote);
+		let withNotes = false;
+		const filtersActive = () => withNotes || selectedColors.size > 0;
+		const visibleEntries = () => {
+			const matchingColors = selectedColors.size > 0 ? filterHighlightsByColor(highlights, selectedColors) : entries;
+			return withNotes ? matchingColors.filter((entry) => entry.note?.trim()) : matchingColors;
 		};
-		selectedCopyLinks.addEventListener('click', () => {
-			const selected = selectedEntries();
-			void this.copyToClipboard(selected.map((entry) => this.formatEntryAsLink(entry)).join('\n\n'), `${selected.length} selected highlights as links`);
+		const copyAnnotations = toolbar.createEl('button', { text: 'Copy annotations' });
+		setTooltip(copyAnnotations, 'Copy the visible highlights and notes as plain Markdown, without links');
+		copyAnnotations.addEventListener('click', () => {
+			const visible = visibleEntries();
+			void this.copyToClipboard(visible.map((entry) => this.formatEntryText(entry)).join('\n\n'), visible.length + ' annotations');
 		});
-		selectedCopyText.addEventListener('click', () => {
-			const selected = selectedEntries();
-			void this.copyToClipboard(selected.map((entry) => this.formatEntryText(entry)).join('\n\n'), `${selected.length} selected highlights`);
-		});
-		selectedExport.addEventListener('click', () => {
-			const selected = selectedEntries();
-			if (selected.length === 0 || !this.scannedSnapshotFingerprint) return;
-			const snapshotFingerprint = this.scannedSnapshotFingerprint;
-			this.close();
-			void this.onExportSelection(selected, snapshotFingerprint);
-		});
-		updateSelectedActions();
-
-		const copyAllLinks = toolbar.createEl('button', { text: 'Copy all as links' });
-		setTooltip(copyAllLinks, 'Copy every highlight as a clickable annotation link (plus notes)');
-		copyAllLinks.addEventListener('click', () => {
-			void this.copyToClipboard(
-				entries.map((e) => this.formatEntryAsLink(e)).join('\n\n'),
-				`${entries.length} highlights as links`,
-			);
-		});
-		const copyAllText = toolbar.createEl('button', { text: 'Copy all text' });
-		setTooltip(copyAllText, 'Copy every highlight and note as plain Markdown, no links');
-		copyAllText.addEventListener('click', () => {
-			void this.copyToClipboard(
-				entries.map((e) => this.formatEntryText(e)).join('\n\n'),
-				`${entries.length} highlights`,
-			);
-		});
-
-		// Last, not first: this one writes a file, so it shouldn't sit where the
-		// copy buttons have trained the user's click to land. Closing first keeps
-		// the modal from covering the note when a new one opens in a tab.
-		const exportToNote = toolbar.createEl('button', { text: 'Export to note' });
-		setTooltip(exportToNote, 'Write these highlights into a note beside the PDF');
-		exportToNote.addEventListener('click', () => {
+		const exportAnnotations = toolbar.createEl('button', { text: 'Export annotations' });
+		setTooltip(exportAnnotations, 'Export the visible highlights and notes');
+		exportAnnotations.addEventListener('click', () => {
 			try { this.assertCurrent(); } catch { this.close(); return; }
+			if (filtersActive()) {
+				const snapshotFingerprint = this.scannedSnapshotFingerprint;
+				if (!snapshotFingerprint) return;
+				const visible = visibleEntries();
+				this.close();
+				void this.onExportSelection(visible, snapshotFingerprint);
+				return;
+			}
 			this.close();
 			void this.onExport();
 		});
 
-		for (const [entryIndex, entry] of entries.entries()) {
-			const row = contentEl.createDiv({ cls: 'study-pdf-list-row' });
-			const checkbox = row.createEl('input');
-			checkbox.type = 'checkbox';
-			checkbox.setAttribute('aria-label', `Select highlight on page ${entry.pageNumber}`);
-			checkbox.addEventListener('click', (event) => event.stopPropagation());
-			checkbox.addEventListener('change', () => {
-				if (checkbox.checked) selectedIndexes.add(entryIndex);
-				else selectedIndexes.delete(entryIndex);
-				updateSelectedActions();
-			});
-			const dot = row.createSpan({ cls: 'study-pdf-color-dot' });
-			dot.setCssStyles({ backgroundColor: entry.colorCss });
-			const body = row.createDiv({ cls: 'study-pdf-list-body' });
-			body.createDiv({ cls: 'study-pdf-list-quote', text: excerptQuote(entry.quote) || '(no text)' });
-			if (entry.note) body.createDiv({ cls: 'study-pdf-list-note', text: entry.note });
-			row.createDiv({ cls: 'study-pdf-list-page', text: `p. ${entry.pageNumber}` });
+		const filterToolbar = contentEl.createDiv({ cls: 'study-pdf-list-filters' });
+		filterToolbar.setAttribute('role', 'group');
+		filterToolbar.setAttribute('aria-label', 'Filter annotations');
+		const filterStatus = contentEl.createDiv({ cls: 'study-pdf-list-filter-status' });
+		filterStatus.setAttribute('role', 'status');
+		filterStatus.setAttribute('aria-live', 'polite');
 
-			const makeCopyButton = (icon: string, tooltip: string, format: () => string) => {
-				const btn = row.createEl('button', { cls: 'clickable-icon study-pdf-list-copy' });
-				setIcon(btn, icon);
-				setTooltip(btn, tooltip);
-				btn.addEventListener('click', (evt) => {
-					evt.stopPropagation(); // don't also navigate
-					void this.copyToClipboard(format(), 'highlight').then((copied) => {
-						if (!copied) return;
-						setIcon(btn, 'check');
-						this.pdfView.containerEl.ownerDocument.defaultView?.setTimeout(() => setIcon(btn, icon), 1200);
-					});
+		const filterButtons = new Map<string, HTMLButtonElement>();
+		const allColors = filterToolbar.createEl('button', { text: 'All colors' });
+		allColors.type = 'button';
+		allColors.setAttribute('aria-pressed', 'true');
+		const notesFilter = filterToolbar.createEl('button', { cls: 'study-pdf-list-filter', text: 'With notes' });
+		notesFilter.type = 'button';
+		notesFilter.setAttribute('aria-pressed', 'false');
+		const colorFilters = collectHighlightColors(highlights);
+		const rowContainer = contentEl.createDiv({ cls: 'study-pdf-list-rows' });
+		const renderRows = () => {
+			rowContainer.empty();
+			const visible = visibleEntries();
+			copyAnnotations.disabled = visible.length === 0;
+			exportAnnotations.disabled = visible.length === 0;
+			filterStatus.setText(filtersActive()
+				? `${visible.length} of ${entries.length} annotations shown.`
+				: '');
+			for (const entry of visible) {
+				const row = rowContainer.createDiv({ cls: 'study-pdf-list-row' });
+				const dot = row.createSpan({ cls: 'study-pdf-color-dot' });
+				dot.setCssStyles({ backgroundColor: entry.colorCss });
+				const body = row.createDiv({ cls: 'study-pdf-list-body' });
+				if (!entry.standaloneNote) {
+					body.createDiv({ cls: 'study-pdf-list-quote', text: excerptQuote(entry.quote) || '(no text)' });
+				}
+				if (entry.note) renderNoteMarkdown(body.createDiv({ cls: 'study-pdf-list-note' }), entry.note);
+				row.createDiv({ cls: 'study-pdf-list-page', text: 'p. ' + entry.pageNumber });
+
+				row.addEventListener('click', () => {
+					if (!this.pdfView.containerEl.ownerDocument.defaultView?.getSelection()?.isCollapsed) return;
+					try { this.assertCurrent(); } catch { this.close(); return; }
+					this.pdfView.goToPage(entry.pageNumber);
+					this.close();
 				});
-			};
-			makeCopyButton('link', 'Copy as annotation link', () => this.formatEntryAsLink(entry));
-			makeCopyButton('copy', 'Copy text only', () => this.formatEntryText(entry));
-
-			row.addEventListener('click', () => {
-				// Selecting text inside the row shouldn't teleport the viewer -- only
-				// treat plain clicks as navigation.
-				if (!this.pdfView.containerEl.ownerDocument.defaultView?.getSelection()?.isCollapsed) return;
-				try { this.assertCurrent(); } catch { this.close(); return; }
-				this.pdfView.goToPage(entry.pageNumber);
-				this.close();
+			}
+		};
+		allColors.addEventListener('click', () => {
+			if (selectedColors.size === 0) return;
+			selectedColors.clear();
+			for (const button of filterButtons.values()) button.setAttribute('aria-pressed', 'false');
+			allColors.setAttribute('aria-pressed', 'true');
+			renderRows();
+		});
+		notesFilter.addEventListener('click', () => {
+			withNotes = !withNotes;
+			notesFilter.setAttribute('aria-pressed', String(withNotes));
+			renderRows();
+		});
+		for (const { colorCss, count } of colorFilters) {
+			const button = filterToolbar.createEl('button', { cls: 'study-pdf-list-filter' });
+			button.type = 'button';
+			button.setAttribute('aria-label', `Filter to ${colorCss}, ${count} highlight${count === 1 ? '' : 's'}`);
+			button.setAttribute('aria-pressed', 'false');
+			const swatch = button.createSpan({ cls: 'study-pdf-list-filter-swatch' });
+			swatch.setCssStyles({ backgroundColor: colorCss });
+			button.createSpan({ cls: 'study-pdf-list-filter-count', text: String(count) });
+			filterButtons.set(colorCss, button);
+			button.addEventListener('click', () => {
+				if (selectedColors.has(colorCss)) selectedColors.delete(colorCss);
+				else selectedColors.add(colorCss);
+				for (const [color, filterButton] of filterButtons) {
+					filterButton.setAttribute('aria-pressed', String(selectedColors.has(color)));
+				}
+				allColors.setAttribute('aria-pressed', String(selectedColors.size === 0));
+				renderRows();
 			});
 		}
+		renderRows();
 	}
 }

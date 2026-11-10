@@ -126,7 +126,7 @@ function estimateWordSpans(str: string, x0: number, width: number): WordSpan[] {
  * "Verdad sobre Dios" vanish from a real highlight's quote). Matching against
  * every quad on the item's baseline instead means a word only needs to be
  * covered by ANY of them. */
-export function extractQuote(rects: QuadRect[], textItems: PdfJsTextItem[]): string {
+export function extractQuote(rects: readonly QuadRect[], textItems: PdfJsTextItem[]): string {
 	const parts: string[] = [];
 	for (const item of textItems) {
 		const baseline = item.transform?.[5];

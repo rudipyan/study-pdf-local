@@ -53,6 +53,7 @@
    in any light/dark theme, exactly like Obsidian's own menus. */
 .study-pdf-popup {
 	position: fixed;
+	width: max-content;
 	display: flex;
 	flex-direction: column;
 	gap: var(--size-2-1);
@@ -222,6 +223,32 @@
 	gap: var(--size-2-1);
 }
 
+.study-pdf-popup.study-pdf-candidate-modal .study-pdf-candidate-text-actions {
+	display: flex;
+	flex: 0 0 auto;
+	align-items: center;
+	flex-wrap: nowrap;
+	gap: 0;
+}
+
+.study-pdf-popup.study-pdf-candidate-modal .study-pdf-candidate-text-actions button {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 30px;
+	min-width: 30px;
+	min-height: 30px;
+	padding: 0;
+}
+
+@media (pointer: coarse) {
+	.study-pdf-popup.study-pdf-candidate-modal .study-pdf-candidate-text-actions button {
+		width: 44px;
+		min-width: 44px;
+		min-height: 44px;
+	}
+}
+
 .study-pdf-candidate-unsupported {
 	color: var(--text-warning);
 	font-size: var(--font-ui-smaller);
@@ -341,6 +368,7 @@
 	border-left: 2px solid var(--interactive-accent);
 	color: var(--text-muted);
 	font-size: var(--font-ui-small);
+	font-style: normal;
 	white-space: pre-wrap;
 	overflow-wrap: break-word;
 }
@@ -359,57 +387,82 @@
 	padding-bottom: var(--size-4-2);
 }
 
+.study-pdf-list-filters {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: var(--size-2-1);
+	padding-bottom: var(--size-2-1);
+}
+.study-pdf-list-filter {
+	display: inline-flex;
+	align-items: center;
+	gap: var(--size-2-1);
+	min-height: 32px;
+	padding: 2px 8px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-s);
+	background: var(--background-primary);
+	color: var(--text-normal);
+}
+.study-pdf-list-filter[aria-pressed="true"] {
+	border-color: var(--interactive-accent);
+	background: var(--background-modifier-hover);
+}
+.study-pdf-list-filter-swatch {
+	width: 14px;
+	height: 14px;
+	flex: 0 0 14px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 50%;
+}
+.study-pdf-list-filter-count {
+	font-size: var(--font-ui-smaller);
+	font-variant-numeric: tabular-nums;
+}
+.study-pdf-list-filter-status {
+	padding-bottom: var(--size-2-1);
+	color: var(--text-muted);
+	font-size: var(--font-ui-small);
+}
+.study-pdf-list-filter-status:empty { display: none; }
+.study-pdf-list-note p:first-child { margin-top: 0; }
+.study-pdf-list-note p:last-child { margin-bottom: 0; }
+.study-pdf-list-note ul,
+.study-pdf-list-note ol,
+.study-pdf-note-preview ul,
+.study-pdf-note-preview ol,
+.study-pdf-note-hover-preview ul,
+.study-pdf-note-hover-preview ol { margin-block: var(--size-2-1); padding-inline-start: 1.5em; }
+.study-pdf-list-note ul,
+.study-pdf-note-preview ul,
+.study-pdf-note-hover-preview ul { list-style-type: disc; }
+
 .study-pdf-list-quote,
 .study-pdf-list-note {
 	user-select: text;
 }
 
-.study-pdf-list-copy {
-	flex-shrink: 0;
-}
-
-.study-pdf-list-row > input[type="checkbox"] {
-	flex: 0 0 auto;
-	margin-top: 3px;
-}
-
 @media (max-width: 480px) {
 	.study-pdf-list-row {
 		display: grid;
-		grid-template-columns: auto auto minmax(0, 1fr) auto auto;
-		grid-template-rows: auto auto;
-		align-items: center;
+		grid-template-columns: auto minmax(0, 1fr) auto;
+		align-items: start;
 	}
 
-	.study-pdf-list-row > input[type="checkbox"] {
+	.study-pdf-list-row > .study-pdf-color-dot {
 		grid-column: 1;
 		grid-row: 1;
 		margin: 0;
 	}
 
-	.study-pdf-list-row > .study-pdf-color-dot {
+	.study-pdf-list-body {
 		grid-column: 2;
 		grid-row: 1;
-		margin: 0;
-	}
-
-	.study-pdf-list-body {
-		grid-column: 1 / -1;
-		grid-row: 2;
 	}
 
 	.study-pdf-list-page {
 		grid-column: 3;
-		grid-row: 1;
-	}
-
-	.study-pdf-list-copy:nth-last-child(2) {
-		grid-column: 4;
-		grid-row: 1;
-	}
-
-	.study-pdf-list-copy:last-child {
-		grid-column: 5;
 		grid-row: 1;
 	}
 
@@ -514,122 +567,166 @@
 	z-index: 2;
 }
 
-/* One persistent annotation row outside the PDF scroller. Only its leading
-   tools scroll; the Focus controls stay pinned at the visible pane edge. */
+/* One row: annotation tools lead, reading controls follow, utilities stay pinned. */
 .study-pdf-annotation-toolbar {
+	--study-pdf-toolbar-surface: var(--background-primary);
 	position: relative;
 	z-index: 1;
 	display: flex;
 	flex: 0 0 auto;
 	align-items: center;
-	justify-content: center;
 	min-width: 0;
 	width: 100%;
 	max-width: 100%;
 	box-sizing: border-box;
 	padding: var(--size-2-1) var(--size-2-2);
 	overflow: hidden;
-	background: var(--background-primary);
+	background: var(--study-pdf-toolbar-surface);
 	border-bottom: 1px solid var(--background-modifier-border);
 }
-
+.study-pdf-annotation-toolbar + .pdf-toolbar { display: none !important; }
+.study-pdf-annotation-dashes {
+	position: absolute;
+	box-sizing: border-box;
+	border: 1px dashed rgba(100, 100, 100, 0.20);
+	pointer-events: none;
+}
 .study-pdf-toolbar-inner {
 	display: flex;
-	flex: 0 1 auto;
+	flex: 1 1 auto;
 	align-items: center;
-	gap: var(--size-2-1);
-	width: max-content;
+	gap: 4px;
+	width: 100%;
 	max-width: 100%;
 	min-width: 0;
-	margin-inline: auto;
 }
-
+.study-pdf-toolbar-scroll-frame { position: relative; flex: 1 1 0%; min-width: 0; }
+.study-pdf-toolbar-scroll-frame::after {
+	position: absolute;
+	inset-block: 0 3px;
+	inset-inline-end: 0;
+	width: 12px;
+	content: '';
+	pointer-events: none;
+	background: linear-gradient(to right, transparent, var(--study-pdf-toolbar-surface));
+}
 .study-pdf-toolbar-scroll {
 	display: flex;
-	flex: 0 1 auto;
 	align-items: center;
-	gap: 2px;
 	min-width: 0;
+	width: 100%;
 	overflow-x: auto;
 	overflow-y: hidden;
 	overscroll-behavior-x: contain;
-	scrollbar-width: none;
+	scrollbar-width: thin;
+	scrollbar-color: var(--background-modifier-border-hover) transparent;
 }
-
-.study-pdf-toolbar-scroll::-webkit-scrollbar {
-	display: none;
+@supports selector(::-webkit-scrollbar) {
+	.study-pdf-toolbar-scroll { scrollbar-width: auto; scrollbar-color: auto; }
+	.study-pdf-toolbar-scroll::-webkit-scrollbar { height: 3px; }
+	.study-pdf-toolbar-scroll::-webkit-scrollbar-track { background: transparent; }
+	.study-pdf-toolbar-scroll::-webkit-scrollbar-thumb { background: var(--background-modifier-border-hover); border-radius: 3px; }
 }
-
-.study-pdf-toolbar-pinned {
-	display: flex;
+.study-pdf-toolbar-scroll-content {
+	display: grid;
+	grid-template-columns: minmax(max-content, 1fr) auto minmax(max-content, 1fr);
 	flex: 0 0 auto;
 	align-items: center;
-	gap: 2px;
+	gap: 4px;
+	width: max-content;
+	min-width: 100%;
+	box-sizing: border-box;
+	padding-inline-end: 12px;
 }
-
-.study-pdf-action-tools[hidden] {
-	display: none !important;
-}
-
+.study-pdf-toolbar-sidebar,
+.study-pdf-toolbar-selection,
+.study-pdf-toolbar-pinned,
+.study-pdf-toolbar-page,
 .study-pdf-toolbar-modes,
 .study-pdf-toolbar-history,
-.study-pdf-toolbar-fit,
-.study-pdf-toolbar-palette {
+.study-pdf-toolbar-palette,
+.study-pdf-toolbar-overview,
+.study-pdf-toolbar-reading {
 	display: flex;
 	flex: 0 0 auto;
 	align-items: center;
 	gap: 2px;
 }
-
-.study-pdf-toolbar-modes {
-	gap: 0;
-	padding: 2px;
-	border: 1px solid var(--background-modifier-border);
-	border-radius: var(--radius-m);
-	background: var(--background-secondary);
-}
-
-.study-pdf-toolbar-modes .study-pdf-tool-button {
+.study-pdf-toolbar-sidebar[hidden],
+.study-pdf-toolbar-separator[hidden],
+.study-pdf-toolbar-page[hidden] { display: none; }
+.study-pdf-toolbar-separator { flex: 0 0 1px; width: 1px; height: 18px; margin-inline: 2px; background: var(--background-modifier-border); }
+.study-pdf-toolbar-selection { gap: 4px; justify-self: start; }
+.study-pdf-toolbar-history { margin-inline-start: 10px; }
+.study-pdf-toolbar-palette { justify-self: center; margin-inline: 12px; }
+.study-pdf-toolbar-reading { gap: 4px; justify-self: end; white-space: nowrap; }
+.study-pdf-toolbar-reading > .pdf-toolbar-left { flex: 0 0 auto; gap: 4px; }
+/* The dedicated sidebar button replaces the native sidebar-options dropdown. */
+.study-pdf-toolbar-reading > .pdf-toolbar-left > .study-pdf-native-sidebar-placeholder + .clickable-icon:has(svg.lucide-chevron-down) { display: none; }
+.study-pdf-toolbar-page { gap: 0; }
+.study-pdf-page-native[hidden] { display: none !important; }
+.study-pdf-toolbar-page .study-pdf-page-trigger {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	gap: 5px;
+	min-width: 48px;
+	min-height: 32px;
+	padding: 0 8px;
 	border: 0;
-	border-radius: var(--radius-s);
+	border-radius: 6px;
+	background: transparent;
 	box-shadow: none;
+	color: var(--text-normal);
+	font-family: inherit;
+	font-size: 13px;
+	font-weight: 500;
+	font-variant-numeric: tabular-nums;
+	line-height: 1;
+	white-space: nowrap;
+	--no-tooltip: true;
 }
-
+.study-pdf-page-prefix { color: var(--text-muted); }
+.study-pdf-toolbar-page .study-pdf-page-trigger:hover,
+.study-pdf-toolbar-page .study-pdf-page-trigger[aria-expanded="true"] { background: var(--background-modifier-hover); }
+.study-pdf-page-trigger:focus-visible { outline: 2px solid var(--interactive-accent); outline-offset: -2px; }
+.study-pdf-popup.study-pdf-page-popup { width: 192px; padding: 12px; }
+.study-pdf-page-field { display: flex; flex-direction: column; gap: 6px; }
+.study-pdf-page-field > label { font-size: 12px; color: var(--text-muted); }
+.study-pdf-page-entry { display: flex; align-items: center; gap: 6px; }
+.study-pdf-page-entry input {
+	width: 100%; min-width: 0; height: 36px; box-sizing: border-box;
+	font-size: 16px; font-variant-numeric: tabular-nums;
+}
+.study-pdf-page-entry .study-pdf-page-go { width: 36px; min-width: 36px; height: 36px; padding: 0; }
+.study-pdf-page-position { margin-top: 8px; font-size: 12px; line-height: 1.4; color: var(--text-muted); }
+.study-pdf-toolbar-modes { gap: 0; padding: 0; border: 0; border-radius: 8px; background: var(--background-secondary); }
+.study-pdf-toolbar-modes .study-pdf-tool-button { border: 0; box-shadow: none; }
 .study-pdf-toolbar-modes .study-pdf-tool-button[aria-pressed="true"] {
 	background: var(--background-modifier-hover);
-	box-shadow: inset 0 0 0 1px var(--background-modifier-border);
+	box-shadow: inset 0 0 0 1px var(--background-modifier-border-hover);
 }
-
-.study-pdf-toolbar-history,
-.study-pdf-toolbar-fit,
-.study-pdf-toolbar-palette {
-	padding-left: var(--size-2-1);
-	border-left: 1px solid var(--background-modifier-border);
-}
-
-.study-pdf-annotation-toolbar .study-pdf-tool-button {
+.study-pdf-annotation-toolbar .study-pdf-tool-button,
+.study-pdf-toolbar-sidebar .clickable-icon,
+.study-pdf-toolbar-reading > .pdf-toolbar-left button,
+.study-pdf-toolbar-reading > .pdf-toolbar-left .clickable-icon {
 	display: inline-flex;
 	align-items: center;
 	justify-content: center;
 	flex: 0 0 auto;
+	width: 32px;
 	min-width: 32px;
 	min-height: 32px;
 	padding: 0;
+	border-radius: 6px;
 	color: var(--text-normal);
 }
-
-.study-pdf-tool-button[aria-pressed="true"] {
-	color: var(--text-normal);
-	background: var(--background-modifier-hover);
-	box-shadow: inset 0 0 0 1px var(--background-modifier-border-hover);
-}
-
+.study-pdf-annotation-toolbar .study-pdf-tool-icon svg,
+.study-pdf-toolbar-sidebar .clickable-icon svg,
+.study-pdf-toolbar-reading > .pdf-toolbar-left .clickable-icon svg { width: 16px; height: 16px; }
+.study-pdf-tool-button[aria-pressed="true"] { color: var(--text-normal); background: var(--background-modifier-hover); box-shadow: inset 0 0 0 1px var(--background-modifier-border-hover); }
 .study-pdf-tool-button:focus-visible,
-.study-pdf-annotation-toolbar .study-pdf-annotation-color:focus-visible {
-	outline: 2px solid var(--interactive-accent);
-	outline-offset: -2px;
-}
-
+.study-pdf-annotation-toolbar .study-pdf-annotation-color:focus-visible { outline: 2px solid var(--interactive-accent); outline-offset: -2px; }
 .study-pdf-annotation-toolbar button.study-pdf-annotation-color {
 	display: inline-flex;
 	flex: 0 0 auto;
@@ -640,40 +737,21 @@
 	min-height: 32px;
 	padding: 0;
 	border: 1px solid transparent;
-	border-radius: var(--radius-m);
+	border-radius: 6px;
 	background: transparent;
 }
-
-.study-pdf-annotation-toolbar .study-pdf-annotation-color[aria-pressed="true"] {
-	background: transparent;
-	box-shadow: none;
-}
-
-.study-pdf-annotation-toolbar .study-pdf-color-dot {
-	width: 18px;
-	height: 18px;
-}
-
-.study-pdf-annotation-toolbar .study-pdf-annotation-color[aria-pressed="true"] .study-pdf-color-dot {
-	outline: 1px solid var(--background-primary);
-	box-shadow: 0 0 0 2px var(--interactive-accent);
-}
-
-@media (pointer: coarse) {
+.study-pdf-annotation-toolbar .study-pdf-annotation-color[aria-pressed="true"] { background: transparent; box-shadow: none; }
+.study-pdf-annotation-toolbar .study-pdf-color-dot { width: 18px; height: 18px; box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.16); }
+.study-pdf-annotation-toolbar .study-pdf-annotation-color[aria-pressed="true"] .study-pdf-color-dot { outline: 2px solid var(--text-normal); outline-offset: 2px; }
+@media (any-pointer: coarse) {
 	.study-pdf-annotation-toolbar .study-pdf-tool-button,
-	.study-pdf-annotation-toolbar button.study-pdf-annotation-color {
-		min-width: 44px;
-		min-height: 44px;
-	}
-
-	.study-pdf-annotation-toolbar button.study-pdf-annotation-color {
-		width: 44px;
-	}
-
-	.study-pdf-annotation-toolbar .study-pdf-color-dot {
-		width: 18px;
-		height: 18px;
-	}
+	.study-pdf-annotation-toolbar button.study-pdf-annotation-color,
+	.study-pdf-toolbar-sidebar .clickable-icon,
+	.study-pdf-toolbar-reading > .pdf-toolbar-left button,
+	.study-pdf-toolbar-reading > .pdf-toolbar-left .clickable-icon { width: 44px; min-width: 44px; min-height: 44px; }
+	.study-pdf-toolbar-page .study-pdf-page-trigger { min-width: 52px; min-height: 44px; font-size: 14px; }
+	.study-pdf-page-entry input { height: 44px; }
+	.study-pdf-page-entry .study-pdf-page-go { width: 44px; min-width: 44px; height: 44px; }
 }
 
 /* The exact owning PDF leaf is promoted above Obsidian's chrome. Its native
@@ -694,8 +772,7 @@
 	--view-bottom-spacing: var(--safe-area-inset-bottom, env(safe-area-inset-bottom, 0px)) !important;
 }
 
-.workspace-leaf.study-pdf-focus .view-header,
-.workspace-leaf.study-pdf-focus:not(.study-pdf-focus-tools) .pdf-toolbar {
+.workspace-leaf.study-pdf-focus .view-header {
 	display: none !important;
 }
 
@@ -747,14 +824,23 @@ body.study-pdf-focus-active .mobile-navbar {
 
 @supports (background: color-mix(in srgb, var(--background-primary) 82%, transparent)) {
 	.workspace-leaf.study-pdf-focus .study-pdf-annotation-toolbar {
-		background: color-mix(in srgb, var(--background-primary) 82%, transparent);
+		--study-pdf-toolbar-surface: color-mix(in srgb, var(--background-primary) 82%, transparent);
+		background: var(--study-pdf-toolbar-surface);
 		backdrop-filter: blur(8px);
 		-webkit-backdrop-filter: blur(8px);
 	}
 }
 
+body.is-mobile .workspace-leaf.study-pdf-focus .study-pdf-annotation-toolbar {
+	--study-pdf-toolbar-surface: var(--background-primary);
+	background: var(--background-primary);
+	backdrop-filter: none;
+	-webkit-backdrop-filter: none;
+}
+
 @media (prefers-reduced-transparency: reduce) {
 	.workspace-leaf.study-pdf-focus .study-pdf-annotation-toolbar {
+		--study-pdf-toolbar-surface: var(--background-primary);
 		background: var(--background-primary);
 		backdrop-filter: none;
 		-webkit-backdrop-filter: none;
@@ -763,6 +849,7 @@ body.study-pdf-focus-active .mobile-navbar {
 
 @media (forced-colors: active) {
 	.workspace-leaf.study-pdf-focus .study-pdf-annotation-toolbar {
+		--study-pdf-toolbar-surface: Canvas;
 		color: CanvasText;
 		background: Canvas;
 		border-color: CanvasText;
@@ -773,4 +860,359 @@ body.study-pdf-focus-active .mobile-navbar {
 	.study-pdf-annotation-toolbar .study-pdf-color-dot {
 		forced-color-adjust: none;
 	}
+}
+
+/* Appearance modes set PDF.js page backgrounds and filter paint canvases only.
+   Text, selection, annotation layers, toolbar controls and popups are not filtered. */
+.study-pdf-reading-appearance-black-white .pdfViewer .page {
+	background-color: #000;
+}
+
+.study-pdf-reading-appearance-black-white .pdfViewer .page .canvasWrapper > canvas {
+	filter: invert(1) hue-rotate(180deg);
+}
+
+.study-pdf-reading-appearance-sepia .pdfViewer .page .canvasWrapper > canvas {
+	filter: brightness(0.94) sepia(0.42);
+}
+
+body.theme-dark :is(
+	.study-pdf-reading-appearance-black-white .pdf-container.mod-themed,
+	.study-pdf-reading-appearance-black-white.pdf-container.mod-themed
+) .pdfViewer .page .canvasWrapper > canvas {
+	filter: none;
+}
+
+body.theme-dark :is(
+	.study-pdf-reading-appearance-sepia .pdf-container.mod-themed,
+	.study-pdf-reading-appearance-sepia.pdf-container.mod-themed
+) .pdfViewer .page .canvasWrapper > canvas {
+	filter: invert(1) brightness(0.94) sepia(0.42);
+}
+
+.study-pdf-reading-appearance-popup {
+	min-width: 156px;
+}
+
+.study-pdf-reading-appearance-option {
+	display: flex;
+	align-items: center;
+	gap: var(--size-2-2);
+	width: 100%;
+	min-height: 32px;
+	padding: var(--size-2-1) var(--size-2-2);
+	color: var(--text-normal);
+	text-align: left;
+}
+
+.study-pdf-reading-appearance-check {
+	display: inline-flex;
+	flex: 0 0 16px;
+	align-items: center;
+	justify-content: center;
+	width: 16px;
+	height: 16px;
+}
+
+.study-pdf-reading-appearance-option[aria-pressed="true"] {
+	background: var(--background-modifier-hover);
+}
+
+@media (pointer: coarse) {
+	.study-pdf-reading-appearance-option {
+		min-height: 44px;
+	}
+}
+
+/* Note buttons sit in the right page margin, aligned to PDF.js's native
+   annotation top. Their descendants remain interactive in the annotation
+   layer, whose native surface may disable pointer events. */
+.study-pdf-note-marker {
+	position: absolute;
+	right: 0;
+	transform: translateY(-50%);
+	z-index: 5;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 44px;
+	min-width: 44px;
+	height: 44px;
+	min-height: 44px;
+	padding: 0;
+	color: var(--study-pdf-note-ink, var(--text-accent));
+	background: transparent;
+	border: 0;
+	box-shadow: none;
+	pointer-events: auto;
+	touch-action: none;
+	user-select: none;
+	-webkit-user-select: none;
+}
+
+.study-pdf-note-marker::before {
+	position: absolute;
+	inset: 11px;
+	content: '';
+	background: var(--study-pdf-note-color, var(--background-primary));
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-s);
+	box-shadow: var(--shadow-s);
+	pointer-events: none;
+}
+
+.study-pdf-note-marker svg {
+	position: relative;
+	z-index: 1;
+	width: 14px;
+	height: 14px;
+}
+
+.study-pdf-note-marker:focus-visible {
+	outline: 2px solid var(--color-accent);
+	outline-offset: 1px;
+}
+
+.study-pdf-link-return-host {
+	position: relative;
+}
+
+.study-pdf-link-return {
+	position: absolute;
+	top: var(--size-2-2);
+	left: calc(var(--safe-area-inset-left, env(safe-area-inset-left, 0px)) + var(--size-2-2));
+	z-index: 25;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 44px;
+	min-width: 44px;
+	height: 44px;
+	min-height: 44px;
+	padding: 0;
+	color: var(--text-normal);
+	background: var(--background-primary);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-m);
+	box-shadow: var(--shadow-s);
+	backdrop-filter: blur(10px);
+	touch-action: manipulation;
+	user-select: none;
+	-webkit-user-select: none;
+}
+
+.study-pdf-link-return[hidden] {
+	display: none;
+}
+
+.study-pdf-link-return svg {
+	width: 16px;
+	height: 16px;
+}
+
+.study-pdf-link-return:focus-visible {
+	outline: 2px solid var(--color-accent);
+	outline-offset: 1px;
+}
+
+@supports (background: color-mix(in srgb, var(--background-primary) 82%, transparent)) {
+	.study-pdf-link-return {
+		background: color-mix(in srgb, var(--background-primary) 82%, transparent);
+	}
+}
+
+/* Only mounted while Select area is enabled; page rendering stays untouched. */
+.study-pdf-region-selector {
+	position: absolute;
+	z-index: 15;
+	cursor: crosshair;
+	touch-action: none;
+	user-select: none;
+	-webkit-user-select: none;
+	overflow: hidden;
+}
+.study-pdf-region-rectangle {
+	position: absolute;
+	pointer-events: none;
+	box-sizing: border-box;
+	border: 2px solid var(--interactive-accent);
+	background: color-mix(in srgb, var(--interactive-accent) 10%, transparent);
+}
+.study-pdf-region-rectangle[hidden] { display: none; }
+
+/* Note editor: compact themed card, with a dedicated drag surface so editing
+   and selecting note text never moves the card. */
+.study-pdf-popup.study-pdf-note-editor {
+	gap: var(--size-2-2);
+	padding: var(--size-2-2);
+	border-radius: var(--radius-l);
+	box-shadow: var(--shadow-l);
+	min-width: 0;
+}
+.study-pdf-note-editor .study-pdf-note-handle {
+	order: 0;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 100%;
+	min-height: 28px;
+	margin: 0;
+	padding: var(--size-2-1);
+	color: var(--text-muted);
+	background: var(--background-secondary);
+	border: 0;
+	border-radius: var(--radius-s);
+	box-shadow: none;
+	cursor: grab;
+	touch-action: none;
+	user-select: none;
+	-webkit-user-select: none;
+}
+.study-pdf-note-editor .study-pdf-note-handle:hover,
+.study-pdf-note-editor .study-pdf-note-handle:focus-visible {
+	color: var(--text-normal);
+	background: var(--background-modifier-hover);
+}
+.study-pdf-note-editor .study-pdf-note-handle:focus-visible {
+	outline: 2px solid var(--interactive-accent);
+	outline-offset: 2px;
+}
+.study-pdf-note-dragging .study-pdf-note-handle { cursor: grabbing; }
+.study-pdf-note-editor .study-pdf-note-handle svg { width: 20px; height: 20px; }
+.study-pdf-note-formatting {
+	order: 1;
+	display: flex;
+	align-items: center;
+	flex-wrap: wrap;
+	gap: var(--size-2-1);
+}
+.study-pdf-note-format-button {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	min-width: 32px;
+	min-height: 32px;
+}
+.study-pdf-note-format-button[aria-pressed="true"] {
+	color: var(--text-on-accent);
+	background: var(--interactive-accent);
+}
+.study-pdf-note-editor .study-pdf-note-input {
+	order: 2;
+	max-width: 100%;
+	min-width: 0;
+	box-sizing: border-box;
+	margin: 0;
+	padding: var(--size-2-2);
+	line-height: 1.5;
+	border-radius: var(--radius-s);
+	background: var(--background-primary);
+}
+.study-pdf-note-editor .study-pdf-note-input.is-preview-hidden {
+	position: absolute;
+	visibility: hidden;
+	pointer-events: none;
+	height: 0 !important;
+	min-height: 0;
+}
+.study-pdf-note-preview {
+	order: 2;
+	max-width: 100%;
+	max-height: 60vh;
+	min-width: 0;
+	padding: var(--size-2-2);
+	overflow: auto;
+	overflow-wrap: anywhere;
+	line-height: 1.55;
+	user-select: text;
+}
+.study-pdf-note-preview p:first-child { margin-top: 0; }
+.study-pdf-note-preview p:last-child { margin-bottom: 0; }
+.study-pdf-note-editor .study-pdf-note-footer { order: 3; justify-content: flex-end; }
+.study-pdf-note-footer .study-pdf-note-status { margin-inline-end: auto; }
+@media (pointer: coarse) {
+	.study-pdf-note-editor .study-pdf-note-handle { min-height: 44px; }
+	.study-pdf-note-format-button { min-width: 44px; min-height: 44px; }
+}
+
+/* Closed comment icons move only after a deliberate drag/hold. */
+.study-pdf-note-marker { cursor: grab; }
+.study-pdf-note-marker-held { cursor: grabbing; }
+.study-pdf-note-marker-held::before {
+	border-color: var(--interactive-accent);
+	outline: 2px solid var(--interactive-accent);
+	outline-offset: 1px;
+}
+.study-pdf-popup.study-pdf-note-hover-preview {
+	background-color: #faf3e6;
+	border-color: #dfd0b8;
+	color: #372c22;
+	padding: 6px 8px;
+	overflow-y: auto;
+	overflow-wrap: anywhere;
+	user-select: text;
+}
+.study-pdf-note-hover-preview p { margin: 0; }
+.study-pdf-note-word-count {
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+	font-variant-numeric: tabular-nums;
+}
+.study-pdf-note-word-count.is-over-limit { color: var(--text-error); }
+
+.study-pdf-note-editor .study-pdf-note-input {
+	font-size: var(--font-ui-medium);
+	line-height: 1.55;
+}
+@media (pointer: coarse) {
+	/* Keep note text readable and avoid iOS focus zoom on small text fields. */
+	.study-pdf-note-editor .study-pdf-note-input { font-size: 16px; }
+}
+
+/* Obsidian's tooltip handler honors this switch while keeping accessible names. */
+.study-pdf-select-tool,
+.study-pdf-comment-tool,
+.study-pdf-note-marker,
+.study-pdf-note-handle {
+	--no-tooltip: true;
+}
+
+.study-pdf-pomodoro-button {
+	flex: 0 0 auto;
+	gap: 5px;
+	width: 56px;
+	min-width: 56px;
+	min-height: 32px;
+	padding: 4px;
+	font-size: 12px;
+	--no-tooltip: true;
+}
+.study-pdf-pomodoro-clock,
+.study-pdf-pomodoro-display { font-variant-numeric: tabular-nums; }
+.study-pdf-pomodoro-button .study-pdf-pomodoro-icon { display: none; }
+.study-pdf-pomodoro-clock { white-space: nowrap; line-height: 1.2; }
+.study-pdf-pomodoro-phase { display: inline-flex; align-items: center; gap: 5px; }
+.study-pdf-pomodoro-phase svg { width: 14px; height: 14px; }
+.study-pdf-pomodoro-button[data-phase="break"] { color: var(--text-success); }
+.study-pdf-pomodoro-button.is-running { background: var(--background-modifier-hover); }
+.study-pdf-pomodoro-popup { width: 220px; gap: 6px; padding: 8px; }
+.study-pdf-pomodoro-heading,
+.study-pdf-pomodoro-actions,
+.study-pdf-pomodoro-sound { display: flex; align-items: center; gap: 6px; }
+.study-pdf-pomodoro-heading { justify-content: space-between; font-size: var(--font-ui-small); }
+.study-pdf-pomodoro-round { color: var(--text-muted); font-size: var(--font-ui-smaller); }
+.study-pdf-pomodoro-display { flex: 1 1 auto; font-size: 20px; font-weight: 500; }
+.study-pdf-pomodoro-actions button,
+.study-pdf-pomodoro-sound button { flex: 0 0 auto; width: 32px; min-width: 32px; height: 32px; padding: 4px; --no-tooltip: true; }
+.study-pdf-pomodoro-sound button[aria-pressed="true"] { background: var(--background-modifier-hover); color: var(--text-accent); }
+.study-pdf-pomodoro-fields { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px; }
+.study-pdf-pomodoro-duration { display: flex; flex-direction: column; gap: 4px; min-width: 0; font-size: var(--font-ui-smaller); color: var(--text-muted); }
+.study-pdf-pomodoro-duration input { width: 100%; min-width: 0; min-height: 32px; box-sizing: border-box; }
+.study-pdf-pomodoro-sound input { flex: 1 1 0; min-width: 0; width: 100%; }
+@media (any-pointer: coarse) {
+	.study-pdf-pomodoro-button { min-height: 44px; }
+	.study-pdf-pomodoro-actions button,
+	.study-pdf-pomodoro-sound button,
+	.study-pdf-pomodoro-duration input { min-width: 44px; min-height: 44px; }
+	.study-pdf-pomodoro-duration input { font-size: 16px; }
 }

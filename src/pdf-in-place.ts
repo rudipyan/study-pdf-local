@@ -27,6 +27,7 @@ export interface PdfPageViewLike {
 	structTreeLayer: unknown;
 	annotationLayer: PdfAnnotationLayerBuilderLike | null;
 	canvas?: HTMLCanvasElement | null;
+	_annotationCanvasMap?: Map<unknown, unknown> | null;
 	detailView?: { update?(options: { underlyingViewUpdated: boolean }): void } | null;
 	_getRenderingContext?: (context: CanvasRenderingContext2D, transform: number[] | null) => Record<string, unknown>;
 }
@@ -37,25 +38,61 @@ export async function refreshPageCanvas(
 	pageView: PdfPageViewLike,
 	updatedPage: PdfPageProxyLike,
 	isCurrent: () => boolean,
+	previewRaster?: HTMLCanvasElement | null,
 ): Promise<void> {
 	const canvas = pageView.canvas;
 	if (!canvas) return; // Offscreen pages will render from their updated proxy.
+	const viewport = pageView.viewport;
+	const parent = canvas.parentNode;
+	const sourcePage = pageView.pdfPage;
+	const pageViewRotate = pageView.pdfPageRotate;
+	const width = canvas.width;
+	const height = canvas.height;
+	const size = viewport as { width?: number; height?: number; scale?: number; rotation?: number } | null;
+	if (!size?.width || !size.height) throw new Error('Study PDF: could not read the page dimensions.');
+	const viewportWidth = size.width;
+	const viewportHeight = size.height;
+	const viewportScale = size.scale;
+	const viewportRotation = size.rotation;
+	const widthStyle = canvas.style?.cssText ?? '';
+	const className = canvas.className ?? '';
+	const parentStyle = canvas.parentElement?.getAttribute?.('style');
+	const parentClassName = canvas.parentElement?.getAttribute?.('class');
+	const previewIsCurrent = previewRaster && previewRaster !== canvas &&
+		previewRaster.width === width && previewRaster.height === height && !pageView._annotationCanvasMap?.size && isCurrent() &&
+		pageView.pdfPage === sourcePage && pageView.pdfPageRotate === pageViewRotate &&
+		pageView.canvas === canvas && pageView.viewport === viewport &&
+		canvas.width === width && canvas.height === height && (canvas.style?.cssText ?? '') === widthStyle &&
+		(canvas.className ?? '') === className && canvas.parentNode === parent &&
+		canvas.parentElement?.getAttribute?.('style') === parentStyle &&
+		canvas.parentElement?.getAttribute?.('class') === parentClassName &&
+		size.width === viewportWidth && size.height === viewportHeight &&
+		size.scale === viewportScale && size.rotation === viewportRotation;
+	const context = canvas.getContext('2d');
+	if (!context) throw new Error('Study PDF: could not create a page drawing context.');
+	const copyRaster = (raster: HTMLCanvasElement) => {
+		context.save();
+		try {
+			context.setTransform(1, 0, 0, 1, 0, 0);
+			context.globalCompositeOperation = 'copy';
+			context.drawImage(raster, 0, 0);
+		} finally {
+			context.restore();
+		}
+	};
+	if (previewIsCurrent && previewRaster && isCurrent()) {
+		copyRaster(previewRaster);
+		return;
+	}
 	if (!updatedPage.render || !pageView._getRenderingContext) {
 		throw new Error('Study PDF: this PDF viewer cannot redraw one page safely.');
 	}
-	const viewport = pageView.viewport;
-	const parent = canvas.parentNode;
-	const width = canvas.width;
-	const height = canvas.height;
 	const scratch = canvas.ownerDocument.createElement('canvas');
 	scratch.width = width;
 	scratch.height = height;
 	try {
 		const scratchContext = scratch.getContext('2d', { alpha: false });
-		const context = canvas.getContext('2d');
-		if (!scratchContext || !context) throw new Error('Study PDF: could not create a page drawing context.');
-		const size = viewport as { width?: number; height?: number } | null;
-		if (!size?.width || !size.height) throw new Error('Study PDF: could not read the page dimensions.');
+		if (!scratchContext) throw new Error('Study PDF: could not create a page drawing context.');
 		const sx = width / size.width;
 		const sy = height / size.height;
 		await updatedPage.render(pageView._getRenderingContext(scratchContext, [sx, 0, 0, sy, 0, 0])).promise;
@@ -63,14 +100,7 @@ export async function refreshPageCanvas(
 			canvas.width !== width || canvas.height !== height || (parent && canvas.parentNode !== parent)) {
 			throw new Error('Study PDF: the page changed while its annotations were being drawn.');
 		}
-		context.save();
-		try {
-			context.setTransform(1, 0, 0, 1, 0, 0);
-			context.globalCompositeOperation = 'copy';
-			context.drawImage(scratch, 0, 0);
-		} finally {
-			context.restore();
-		}
+		copyRaster(scratch);
 	} finally {
 		scratch.width = scratch.height = 0;
 	}

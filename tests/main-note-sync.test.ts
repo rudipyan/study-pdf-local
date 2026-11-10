@@ -13,6 +13,15 @@ vi.mock('../src/pdf-highlights', () => ({
 		quote: 'Original quotation', note: 'Updated question', annotationId: '12R',
 	}]),
 }));
+vi.mock('../src/obsidian-pdf-internals', async (importOriginal) => {
+	const actual = await importOriginal<typeof import('../src/obsidian-pdf-internals')>();
+	return {
+		...actual,
+		createPdfJsDocumentSnapshot: vi.fn(() => ({
+			document: Promise.resolve({}), cancel: vi.fn(), dispose: vi.fn(async () => {}),
+		})),
+	};
+});
 
 import { TFile, Notice } from 'obsidian';
 import StudyPdf from '../src/main';

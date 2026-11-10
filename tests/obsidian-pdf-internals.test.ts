@@ -63,7 +63,245 @@ function makeViewer() {
 	};
 }
 
-afterEach(() => { vi.restoreAllMocks(); });
+afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
+
+it.each([false, true])('outlines exact annotation fragments and cleans up, clipped multi-line: %s', (multiLine) => {
+	const f = makeViewer(); const classes = new Set<string>();
+	const frames: { remove: ReturnType<typeof vi.fn>; setCssStyles: ReturnType<typeof vi.fn> }[] = [];
+	const bounds = [{ x: '0', y: '0', width: '0.8', height: '0.2' }, { x: '0', y: '0.3', width: '0.4', height: '0.2' }];
+	const element = {
+		classList: { add: (value: string) => classes.add(value), remove: (value: string) => classes.delete(value) },
+		querySelectorAll: () => multiLine ? bounds.map(bound => ({ getAttribute: (name: keyof typeof bound) => bound[name] })) : [],
+		createDiv: () => { const frame = { remove: vi.fn(), setAttribute: vi.fn(), setCssStyles: vi.fn() }; frames.push(frame); return frame; },
+	};
+	const query = vi.fn(() => [element]);
+	Object.assign(f.page, { div: { querySelectorAll: query } });
+	const listeners = new Map<string, (event: { pageNumber: number }) => void>();
+	Object.assign(f.application, { eventBus: {
+		_on: (name: string, fn: (event: { pageNumber: number }) => void) => listeners.set(name, fn),
+		_off: (name: string) => listeners.delete(name),
+	} });
+	const clear = f.view.markSelectedAnnotation!({ pageIndex: 0, objectNumber: 12, generationNumber: 2, sourceFingerprint: 'source' });
+	expect(query).toHaveBeenCalledExactlyOnceWith('.highlightAnnotation[data-annotation-id="12R2"]');
+	expect(classes.has('study-pdf-selected-annotation')).toBe(true);
+	expect(frames).toHaveLength(multiLine ? 2 : 1);
+	if (multiLine) expect(frames[1]!.setCssStyles).toHaveBeenCalledWith({ left: '0%', top: '30%', width: '40%', height: '20%' });
+	listeners.get('annotationlayerrendered')!({ pageNumber: 2 }); expect(query).toHaveBeenCalledOnce();
+	listeners.get('annotationlayerrendered')!({ pageNumber: 1 }); expect(query).toHaveBeenCalledTimes(2);
+	clear(); expect(classes.size).toBe(0); expect(listeners.size).toBe(0);
+	for (const frame of frames) expect(frame.remove).toHaveBeenCalledOnce();
+});
+
+it('defers selected-outline rebuilds during scale bursts and ignores disposed callbacks', () => {
+ vi.useFakeTimers(); const f = makeViewer(); const createDiv = vi.fn(() => ({ remove: vi.fn(), setAttribute: vi.fn(), setCssStyles: vi.fn() }));
+ const element = { classList: { add() {}, remove() {} }, querySelectorAll: () => [], createDiv };
+ const query = vi.fn(() => [element]); Object.assign(f.page, { div: { querySelectorAll: query } });
+ const listeners = new Map<string, (event?: { pageNumber: number }) => void>();
+ Object.assign(f.application, { eventBus: { _on: (name: string, fn: (event?: { pageNumber: number }) => void) => listeners.set(name, fn), _off: (name: string) => listeners.delete(name) } });
+ const clear = f.view.markSelectedAnnotation!({ pageIndex: 0, objectNumber: 12, generationNumber: 0, sourceFingerprint: 'source' });
+ const rendered = listeners.get('annotationlayerrendered')!; const scale = listeners.get('scalechanging')!;
+ scale(); rendered({ pageNumber: 1 }); vi.advanceTimersByTime(100); scale(); rendered({ pageNumber: 1 });
+ expect(createDiv).toHaveBeenCalledOnce(); vi.advanceTimersByTime(150); expect(createDiv).toHaveBeenCalledTimes(2);
+ scale(); rendered({ pageNumber: 1 }); clear(); vi.runAllTimers(); rendered({ pageNumber: 1 }); scale();
+ expect(createDiv).toHaveBeenCalledTimes(2); expect(listeners.size).toBe(0); expect(vi.getTimerCount()).toBe(0);
+});
+
+it('follows native page navigation across file changes in one pane and unregisters exact callbacks', () => {
+	const f = makeViewer();
+	const listeners = new Map<string, () => void>();
+	Object.assign(f.application, { eventBus: {
+		_on: (name: string, fn: () => void) => listeners.set(name, fn),
+		_off: (name: string, fn: () => void) => { if (listeners.get(name) === fn) listeners.delete(name); },
+	} });
+	const changed = vi.fn();
+	const stop = f.view.watchPagePosition!(changed);
+	listeners.get('pagechanging')!(); expect(changed).toHaveBeenCalledOnce();
+	f.rawView.file = { path: 'another.pdf' };
+	listeners.get('pagechanging')!(); expect(changed).toHaveBeenCalledTimes(2);
+	stop(); expect(listeners.size).toBe(0);
+});
+
+it('ignores page callbacks from a replaced native event bus', () => {
+	const f = makeViewer(); let onChange!: () => void;
+	Object.assign(f.application, { eventBus: { _on: (_name: string, fn: () => void) => { onChange = fn; }, _off() {} } });
+	const changed = vi.fn(); const stop = f.view.watchPagePosition!(changed);
+	Object.assign(f.application, { eventBus: { _on() {}, _off() {} } });
+	onChange(); expect(changed).not.toHaveBeenCalled(); stop();
+});
+
+it('retires an old temporary worker after its last layer disappears without another annotation save', async () => {
+	const f = makeViewer();
+	const listeners = new Map<string, () => void>();
+	Object.assign(f.application, { eventBus: {
+		_on: (name: string, fn: () => void) => listeners.set(name, fn),
+		_off: (name: string) => listeners.delete(name),
+	} });
+	const save = async (revision: number) => {
+		const bytes = new Uint8Array([revision]);
+		const token = await f.view.prepareInPlacePdfWrite(bytes);
+		f.save(bytes);
+		expect(await f.view.refreshAnnotationsInPlace(bytes, [0], token!)).toBe('refreshed');
+	};
+	await save(2);
+	const retainedLayer = { pdfPage: f.page.pdfPage as typeof f.page.pdfPage | null };
+	Object.assign(f.page, { textLayer: retainedLayer });
+	await save(3);
+	expect(f.tasks[0]!.destroy).not.toHaveBeenCalled();
+	listeners.get('pagerendered')!();
+	await new Promise((resolve) => setTimeout(resolve, 5));
+	expect(f.tasks[0]!.destroy).not.toHaveBeenCalled();
+	retainedLayer.pdfPage = null;
+	listeners.get('textlayerrendered')!();
+	await vi.waitFor(() => expect(f.tasks[0]!.destroy).toHaveBeenCalledOnce());
+	expect(f.tasks[1]!.destroy).not.toHaveBeenCalled();
+	expect(f.originalTask.destroy).not.toHaveBeenCalled();
+	await f.rawView.onClose();
+	expect(listeners.size).toBe(0);
+});
+
+it.each([
+	['pdfThumbnailViewer', 'pdfDocument', 'thumbnailrendered'],
+	['pdfLinkService', 'pdfDocument', 'pagerendered'],
+	['findController', '_pdfDocument', 'textlayerrendered'],
+	['printService', 'pdfDocument', 'afterprint'],
+])('keeps an obsolete document while native %s still owns it', async (ownerName, documentKey, event) => {
+	const f = makeViewer();
+	const listeners = new Map<string, () => void>();
+	const owner: Record<string, unknown> = { getThumbnail: () => undefined, [documentKey!]: f.pdfViewer.pdfDocument };
+	Object.assign(f.application, { [ownerName!]: owner, eventBus: {
+		_on: (name: string, fn: () => void) => listeners.set(name, fn),
+		_off: (name: string) => listeners.delete(name),
+	} });
+	for (const revision of [2, 3]) {
+		const bytes = new Uint8Array([revision]);
+		const token = await f.view.prepareInPlacePdfWrite(bytes);
+		f.save(bytes);
+		expect(await f.view.refreshAnnotationsInPlace(bytes, [0], token!)).toBe('refreshed');
+		if (revision === 2) owner[documentKey!] = f.documents.get(2);
+	}
+	expect(f.tasks[0]!.destroy).not.toHaveBeenCalled();
+	owner[documentKey!] = null;
+	listeners.get(event!)!();
+	await vi.waitFor(() => expect(f.tasks[0]!.destroy).toHaveBeenCalledOnce());
+	await f.rawView.onClose();
+});
+
+function makeNoteWatcherFixture() {
+	const fixture = makeViewer();
+	const listeners = new Map<string, (event: { source: { id: number } }) => void>();
+	const bus = {
+		_on: vi.fn((name: string, callback: (event: { source: { id: number } }) => void) => listeners.set(name, callback)),
+		_off: vi.fn((name: string) => listeners.delete(name)),
+	};
+	const layer = { remove: vi.fn(), closest: () => ({ dataset: { pageNumber: '1' } }) };
+	const getAnnotation = vi.fn((id: string) => ({ data: { subtype: 'Highlight', contentsObj: { str: `Note ${id}` } } }));
+	Object.assign(fixture.page.annotationLayer!, { div: layer, annotationLayer: { getAnnotation } });
+	Object.assign(fixture.application, { eventBus: bus });
+	const querySelectorAll = vi.fn(() => [layer]);
+	Object.assign(fixture.rawView.containerEl, { querySelectorAll, contains: (node: unknown) => node === fixture.page.annotationLayer?.div });
+	return { ...fixture, bus, listeners, layer, querySelectorAll, getAnnotation };
+}
+
+describe('rendered note layer watchers', () => {
+ it('coalesces native scale bursts using current layers but keeps explicit refresh immediate', () => {
+  vi.useFakeTimers(); const f = makeNoteWatcherFixture(); const publish = vi.fn(); const watcher = f.view.watchNoteLayers!(publish);
+  f.listeners.get('scalechanging')!({ source: { id: 1 } });
+  f.listeners.get('annotationlayerrendered')!({ source: { id: 1 } });
+  vi.advanceTimersByTime(100); f.listeners.get('scalechanging')!({ source: { id: 1 } });
+  f.listeners.get('annotationlayerrendered')!({ source: { id: 1 } });
+  expect(publish).toHaveBeenCalledOnce();
+  watcher.refresh([0]); expect(publish).toHaveBeenCalledTimes(2);
+  f.listeners.get('annotationlayerrendered')!({ source: { id: 1 } });
+  Object.assign(f.page.viewport, { width: 1200 });
+  const replacementLayer = { remove: vi.fn() }; Object.assign(f.page.annotationLayer!, { div: replacementLayer });
+  vi.advanceTimersByTime(149); expect(publish).toHaveBeenCalledTimes(2);
+  vi.advanceTimersByTime(1); expect(publish).toHaveBeenCalledTimes(3); expect(publish.mock.lastCall![0].viewportWidth).toBe(1200); expect(publish.mock.lastCall![0].layer).toBe(replacementLayer);
+  watcher.dispose(); expect(vi.getTimerCount()).toBe(0);
+ });
+ it('publishes each pending page once after scaling and removes explicitly refreshed pages from the queue', () => {
+  vi.useFakeTimers(); const f = makeNoteWatcherFixture(); const publish = vi.fn(); const watcher = f.view.watchNoteLayers!(publish);
+  f.listeners.get('scalechanging')!({ source: { id: 1 } });
+  for (const id of [1, 2, 1, 2]) f.listeners.get('annotationlayerrendered')!({ source: { id } });
+  watcher.refresh([0]); expect(publish).toHaveBeenCalledTimes(2);
+  vi.advanceTimersByTime(150); expect(publish).toHaveBeenCalledTimes(3); expect(publish.mock.lastCall![0].pageIndex).toBe(1);
+  watcher.dispose();
+ });
+ it.each(['dispose', 'file', 'bus', 'viewer'])('ignores deferred scale callbacks after %s changes', (reason) => {
+  vi.useFakeTimers(); const f = makeNoteWatcherFixture(); const publish = vi.fn(); const watcher = f.view.watchNoteLayers!(publish);
+  const scale = f.listeners.get('scalechanging')!; const rendered = f.listeners.get('annotationlayerrendered')!;
+  scale({ source: { id: 1 } }); rendered({ source: { id: 1 } });
+  if (reason === 'dispose') watcher.dispose();
+  if (reason === 'file') f.rawView.file = { path: 'other.pdf' };
+  if (reason === 'bus') Object.assign(f.application, { eventBus: {} });
+  if (reason === 'viewer') Object.assign(f.application, { pdfViewer: {} });
+  vi.runAllTimers(); scale({ source: { id: 1 } }); rendered({ source: { id: 1 } });
+  expect(publish).toHaveBeenCalledOnce(); expect(vi.getTimerCount()).toBe(0); watcher.dispose();
+ });
+
+	it.each([0, 90, 180, 270])('reports native layer dimensions correctly at %i degrees', (rotation) => {
+		const f = makeNoteWatcherFixture(); const quarter = rotation % 180 === 90;
+		Object.assign(f.page.viewport, { width: quarter ? 800 : 600, height: quarter ? 600 : 800, rotation });
+		const publish = vi.fn(); const watcher = f.view.watchNoteLayers!(publish);
+		expect(publish.mock.calls[0]![0].viewportWidth).toBe(600);
+		expect(publish.mock.calls[0]![0].viewportHeight).toBe(800); watcher.dispose();
+	});
+	it('uses already-rendered data with no file reads, worker scans, or page loading', () => {
+		const fixture = makeNoteWatcherFixture();
+		const publish = vi.fn();
+		const watcher = fixture.view.watchNoteLayers!(publish);
+		expect(publish).toHaveBeenCalledOnce();
+		expect(publish.mock.calls[0]![0].readAnnotation('12R').contentsObj.str).toBe('Note 12R');
+		watcher.refresh([0]);
+		fixture.listeners.get('annotationlayerrendered')!({ source: { id: 1 } });
+		expect(publish).toHaveBeenCalledTimes(3);
+		expect(fixture.querySelectorAll).toHaveBeenCalledOnce();
+		expect(fixture.app.vault.readBinary).not.toHaveBeenCalled();
+		expect(fixture.originalTask.destroy).not.toHaveBeenCalled();
+		expect(fixture.tasks).toHaveLength(0);
+		watcher.dispose();
+		expect(fixture.bus._off).toHaveBeenCalledTimes(2);
+		watcher.refresh([0]);
+		expect(publish).toHaveBeenCalledTimes(3);
+	});
+
+	it('invalidates old layer data and follows only explicit refreshed pages', () => {
+		const fixture = makeNoteWatcherFixture();
+		const publish = vi.fn();
+		const watcher = fixture.view.watchNoteLayers!(publish);
+		const oldRead = publish.mock.calls[0]![0].readAnnotation;
+		const replacementLookup = vi.fn(() => ({ data: { subtype: 'Highlight', contentsObj: { str: 'New note' } } }));
+		Object.assign(fixture.page.annotationLayer!, { annotationLayer: { getAnnotation: replacementLookup } });
+		expect(oldRead('12R')).toBeNull();
+		watcher.refresh([0]);
+		expect(publish.mock.calls[1]![0].readAnnotation('12R').contentsObj.str).toBe('New note');
+		expect(fixture.querySelectorAll).toHaveBeenCalledOnce();
+		watcher.dispose();
+	});
+
+	it('rejects a replaced event bus or reused PDF pane and unregisters cleanly', () => {
+		const fixture = makeNoteWatcherFixture();
+		const publish = vi.fn();
+		const watcher = fixture.view.watchNoteLayers!(publish);
+		expect(watcher.isCurrent()).toBe(true);
+		Object.assign(fixture.application, { eventBus: { _on: vi.fn(), _off: vi.fn() } });
+		expect(watcher.isCurrent()).toBe(false);
+		watcher.refresh([0]);
+		fixture.listeners.get('annotationlayerrendered')!({ source: { id: 1 } });
+		expect(publish).toHaveBeenCalledOnce();
+		watcher.dispose();
+		expect(fixture.bus._off).toHaveBeenCalledTimes(2);
+	});
+
+	it('does not accept an unready or unsupported native event bus', () => {
+		const fixture = makeNoteWatcherFixture();
+		Object.assign(fixture.application, { eventBus: null });
+		const publish = vi.fn();
+		const watcher = fixture.view.watchNoteLayers!(publish);
+		expect(watcher.isCurrent()).toBe(false);
+		expect(publish).not.toHaveBeenCalled();
+		watcher.dispose();
+	});
+});
 
 describe('Obsidian PDF in-place integration', () => {
 	it('keeps the page and canvas across repeated saves using the shipped viewer shape', async () => {

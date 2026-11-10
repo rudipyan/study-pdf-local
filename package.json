@@ -1,6 +1,6 @@
 {
 	"name": "study-pdf-local",
-	"version": "0.5.0",
+	"version": "0.6.0",
 	"description": "Highlight PDFs with custom colors, edit comments, and export annotations and quotations.",
 	"main": "main.js",
 	"type": "module",

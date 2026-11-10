@@ -44,17 +44,27 @@ export function normalizeOverlayRects(rects: OverlayRect[]): OverlayRect[] {
 	const usable = rects.filter((r) => r.width >= 1 && r.height >= 1);
 	const out: OverlayRect[] = [];
 	for (const rect of usable) {
-		const merged = out.find((o) => onSameLine(o, rect) && touchesHorizontally(o, rect));
-		if (!merged) {
-			out.push({ ...rect });
-			continue;
+		let merged = { ...rect };
+		for (let index = 0; index < out.length;) {
+			const current = out[index]!;
+			if (!onSameLine(current, merged) || !touchesHorizontally(current, merged)) {
+				index++;
+				continue;
+			}
+			const left = Math.min(current.left, merged.left);
+			const top = Math.min(current.top, merged.top);
+			merged = {
+				left,
+				top,
+				width: Math.max(current.left + current.width, merged.left + merged.width) - left,
+				height: Math.max(current.top + current.height, merged.top + merged.height) - top,
+			};
+			out.splice(index, 1);
+			// The wider union can connect to rectangles visited earlier, including
+			// in reversed DOM order. Recheck only the existing bounded output list.
+			index = 0;
 		}
-		const left = Math.min(merged.left, rect.left);
-		const top = Math.min(merged.top, rect.top);
-		merged.width = Math.max(merged.left + merged.width, rect.left + rect.width) - left;
-		merged.height = Math.max(merged.top + merged.height, rect.top + rect.height) - top;
-		merged.left = left;
-		merged.top = top;
+		out.push(merged);
 	}
 	return out;
 }
@@ -70,23 +80,147 @@ function touchesHorizontally(a: OverlayRect, b: OverlayRect): boolean {
 	return b.left <= a.left + a.width + 1 && a.left <= b.left + b.width + 1;
 }
 
+interface OverlayPdfView {
+	containerEl: HTMLElement;
+	getPdfScrollElement(): HTMLElement | null;
+	findPageIndexForNode(node: Node): number | null;
+	getPageElement(pageIndex: number): HTMLElement | null;
+}
+
+/** Visual preview only. Saving still captures and validates every selected
+ * text fragment separately; this path never walks text nodes or reads PDF data. */
+export function liveSelectionOverlayRects(view: OverlayPdfView, range: Range): OverlayRect[] {
+	try {
+		const pane = view.containerEl;
+		const doc = pane.ownerDocument;
+		const win = doc.defaultView;
+		const scroll = view.getPdfScrollElement();
+		if (!win || !scroll || !pane.contains(scroll) || range.collapsed ||
+			!range.startContainer.isConnected || !range.endContainer.isConnected ||
+			!pane.contains(range.startContainer) || !pane.contains(range.endContainer)) return [];
+		const textLayerFor = (node: Node) => (node.nodeType === 1 ? node as Element : node.parentElement)?.closest<HTMLElement>('.textLayer') ?? null;
+		const firstLayer = textLayerFor(range.startContainer);
+		const lastLayer = textLayerFor(range.endContainer);
+		const firstPage = view.findPageIndexForNode(range.startContainer);
+		const lastPage = view.findPageIndexForNode(range.endContainer);
+		if (!firstLayer || !lastLayer || firstPage === null || lastPage === null ||
+			!Number.isInteger(firstPage) || firstPage < 0 || !Number.isInteger(lastPage) || firstPage > lastPage) return [];
+		const layers: HTMLElement[] = [];
+		for (let index = firstPage; index <= lastPage; index++) {
+			const page = view.getPageElement(index);
+			const layer = page?.matches('.textLayer') ? page : page?.querySelector<HTMLElement>('.textLayer');
+			if (!layer || !layer.isConnected || !pane.contains(layer) ||
+				(index === firstPage && layer !== firstLayer) || (index === lastPage && layer !== lastLayer)) return [];
+			layers.push(layer);
+		}
+		const viewport = win.visualViewport;
+		let left = Math.max(0, viewport?.offsetLeft ?? 0);
+		let top = Math.max(0, viewport?.offsetTop ?? 0);
+		let right = Math.min(win.innerWidth, left + (viewport?.width ?? win.innerWidth));
+		let bottom = Math.min(win.innerHeight, top + (viewport?.height ?? win.innerHeight));
+		const intersect = (rect: { left: number; top: number; right: number; bottom: number }) => {
+			left = Math.max(left, rect.left); top = Math.max(top, rect.top);
+			right = Math.min(right, rect.right); bottom = Math.min(bottom, rect.bottom);
+		};
+		intersect(pane.getBoundingClientRect());
+		const scrollRect = scroll.getBoundingClientRect();
+		intersect({ left: scrollRect.left + scroll.clientLeft, top: scrollRect.top + scroll.clientTop,
+			right: scrollRect.left + scroll.clientLeft + scroll.clientWidth,
+			bottom: scrollRect.top + scroll.clientTop + scroll.clientHeight });
+		// The pane/scroller and clipping wrappers bound body-level fixed paint.
+		// This is one ancestor walk per animation frame, never a page/text scan.
+		let ancestor = scroll.parentElement;
+		while (ancestor && ancestor !== doc.documentElement) {
+			const style = win.getComputedStyle(ancestor);
+			const rect = ancestor.getBoundingClientRect();
+			if (style.overflowX !== 'visible') {
+				left = Math.max(left, rect.left + ancestor.clientLeft);
+				right = Math.min(right, rect.left + ancestor.clientLeft + ancestor.clientWidth);
+			}
+			if (style.overflowY !== 'visible') {
+				top = Math.max(top, rect.top + ancestor.clientTop);
+				bottom = Math.min(bottom, rect.top + ancestor.clientTop + ancestor.clientHeight);
+			}
+			ancestor = ancestor.parentElement;
+		}
+		const toolbar = pane.querySelector<HTMLElement>('.study-pdf-annotation-toolbar');
+		if (toolbar) top = Math.max(top, toolbar.getBoundingClientRect().bottom);
+		if (right <= left || bottom <= top) return [];
+		const rects: OverlayRect[] = [];
+		for (let index = 0; index < layers.length; index++) {
+			const layer = layers[index]!;
+			const layerRect = layer.getBoundingClientRect();
+			if (layerRect.right <= left || layerRect.left >= right || layerRect.bottom <= top || layerRect.top >= bottom) continue;
+			// A cross-page Range includes page wrappers and annotation UI. Restrict
+			// each native subrange to one textLayer before asking WebKit for boxes.
+			const visualRange = layers.length === 1 ? range : range.cloneRange();
+			if (index > 0) visualRange.setStart(layer, 0);
+			if (index < layers.length - 1) visualRange.setEnd(layer, layer.childNodes.length);
+			// PDF.js moves its full-page endOfContent sentinel next to the native
+			// anchor while handles move. It can sit between selected text spans:
+			// split around it rather than truncating the selected text after it.
+			const sentinel = layer.querySelector<HTMLElement>('.endOfContent');
+			let nativeRanges = [visualRange];
+			if (sentinel && visualRange.intersectsNode(sentinel)) {
+				const before = visualRange.cloneRange();
+				before.setEndBefore(sentinel);
+				const after = visualRange.cloneRange();
+				after.setStartAfter(sentinel);
+				nativeRanges = [before, after];
+			}
+			for (const nativeRange of nativeRanges) {
+				for (const rect of Array.from(nativeRange.getClientRects())) {
+					const x = Math.max(left, layerRect.left, rect.left);
+					const y = Math.max(top, layerRect.top, rect.top);
+					const width = Math.min(right, layerRect.right, rect.right) - x;
+					const height = Math.min(bottom, layerRect.bottom, rect.bottom) - y;
+					if ([x, y, width, height].every(Number.isFinite) && width >= 1 && height >= 1) rects.push({ left: x, top: y, width, height });
+				}
+			}
+		}
+		return rects;
+	} catch {
+		// A detached native selection clears the optional preview only.
+		return [];
+	}
+}
+
 export function createSelectionOverlay(doc: Document): SelectionOverlay {
 	const el = doc.body.createDiv({ cls: 'study-pdf-selection-overlay' });
+	const elements: HTMLElement[] = [];
+	const geometrySignatures: string[] = [];
+	const colors: string[] = [];
+	let disposed = false;
 	return {
 		update(rects: OverlayRect[], color?: string) {
-			el.empty();
-			for (const rect of normalizeOverlayRects(rects)) {
-				const rectEl = el.createDiv({ cls: 'study-pdf-selection-rect' });
-				rectEl.setCssStyles({
-					left: `${rect.left}px`,
-					top: `${rect.top}px`,
-					width: `${rect.width}px`,
-					height: `${rect.height}px`,
-				});
-				if (color) rectEl.style.backgroundColor = color;
+			if (disposed) return;
+			const normalized = normalizeOverlayRects(rects);
+			while (elements.length > normalized.length) {
+				elements.pop()!.remove();
+				geometrySignatures.pop();
+				colors.pop();
+			}
+			for (let index = 0; index < normalized.length; index++) {
+				const rect = normalized[index]!;
+				const rectEl = elements[index] ?? el.createDiv({ cls: 'study-pdf-selection-rect' });
+				elements[index] = rectEl;
+				const geometry = `${rect.left},${rect.top},${rect.width},${rect.height}`;
+				if (geometrySignatures[index] !== geometry) {
+					rectEl.setCssStyles({ left: `${rect.left}px`, top: `${rect.top}px`, width: `${rect.width}px`, height: `${rect.height}px` });
+					geometrySignatures[index] = geometry;
+				}
+				const nextColor = color ?? '';
+				if (colors[index] !== nextColor) {
+					rectEl.style.backgroundColor = nextColor;
+					colors[index] = nextColor;
+				}
 			}
 		},
 		destroy() {
+			disposed = true;
+			elements.length = 0;
+			geometrySignatures.length = 0;
+			colors.length = 0;
 			el.remove();
 		},
 	};

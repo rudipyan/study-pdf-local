@@ -5,6 +5,12 @@
 // (hardcoded colors, unreadable in dark themes) can't recur.
 import { Scope, setIcon, setTooltip, type App } from 'obsidian';
 import { popupMaxSize } from '../palette-editor';
+import { bindPopupDragging } from './popup-drag';
+import { bindAutoNoteSize, countNoteWords, NOTE_WORD_LIMIT } from './note-editor-size';
+import { bindNoteDictation } from './note-dictation';
+import { createNoteFormattingControls } from './note-formatting-controls';
+
+let nextNoteCounterId = 0;
 
 export type PopupButton =
 	| { type: 'color'; hex: string; name: string; onClick: () => void }
@@ -12,11 +18,28 @@ export type PopupButton =
 
 export interface IconPopup {
 	el: HTMLElement;
-	/** Repositions the popup after viewport movement. */
+	/** Schedules one coalesced reposition after viewport movement. */
 	reposition(): void;
 	/** Candidate chooser remains open while the visual viewport moves. */
 	preserveOnScroll?: boolean;
+	/** A host microphone permission prompt may temporarily take window focus. */
+	readonly preserveOnBlur?: boolean;
 	hide(): void;
+}
+
+export interface PopupPositioning {
+	/** Coalesces event-driven positioning and optional layout work into one frame. */
+	schedule(beforePosition?: () => void, afterPosition?: () => void): void;
+	/** Applies layout and positioning immediately, canceling a pending frame. */
+	reposition(beforePosition?: () => void, afterPosition?: () => void): void;
+	dispose(): void;
+}
+
+export interface PopupAnchor {
+	x: number;
+	y: number;
+	/** Bottom edge to use when there is room above the anchor instead. */
+	aboveY?: number;
 }
 
 /** Clamp into the viewport after layout so the popup never overflows an edge.
@@ -24,7 +47,7 @@ export interface IconPopup {
  * attach as part of creation (unlike document.createElement, which returns a
  * detached node), so by the time an element exists here, it's already in the
  * tree -- this only positions it. */
-export function positionPopup(doc: Document, el: HTMLElement, position: { x: number; y: number }) {
+export function positionPopup(doc: Document, el: HTMLElement, position: PopupAnchor, limits?: { width: number; height: number }) {
 	const win = doc.defaultView ?? window;
 	// visualViewport shrinks when the on-screen keyboard opens (e.g. for the
 	// note editor's textarea); innerWidth/innerHeight don't, so clamping
@@ -35,40 +58,76 @@ export function positionPopup(doc: Document, el: HTMLElement, position: { x: num
 	const viewportWidth = viewport?.width ?? win.innerWidth;
 	const viewportHeight = viewport?.height ?? win.innerHeight;
 	const maxSize = popupMaxSize({ width: viewportWidth, height: viewportHeight });
-	el.setCssStyles({
-		left: '0px',
-		top: '0px',
-		maxWidth: `${maxSize.width}px`,
-		maxHeight: `${maxSize.height}px`,
-		boxSizing: 'border-box',
-		overflowY: 'auto',
-	});
+	const setStyleIfChanged = (property: 'left' | 'top' | 'maxWidth' | 'maxHeight' | 'boxSizing' | 'overflowY', value: string) => {
+		if (el.style[property] !== value) el.style[property] = value;
+	};
+	setStyleIfChanged('maxWidth', `${Math.min(maxSize.width, limits?.width ?? Infinity)}px`);
+	setStyleIfChanged('maxHeight', `${Math.min(maxSize.height, limits?.height ?? Infinity)}px`);
+	setStyleIfChanged('boxSizing', 'border-box');
+	setStyleIfChanged('overflowY', 'auto');
 	const { width, height } = el.getBoundingClientRect();
-	el.setCssStyles({
-		left: `${Math.max(viewportLeft + 4, Math.min(position.x + viewportLeft, viewportLeft + viewportWidth - width - 4))}px`,
-		top: `${Math.max(viewportTop + 4, Math.min(position.y + viewportTop, viewportTop + viewportHeight - height - 4))}px`,
-	});
+	setStyleIfChanged('left', `${Math.max(viewportLeft + 4, Math.min(position.x + viewportLeft, viewportLeft + viewportWidth - width - 4))}px`);
+	const bottomAlignedTop = viewportHeight - height - 4;
+	const above = position.aboveY === undefined ? -Infinity : position.aboveY - height;
+	const top = position.y > bottomAlignedTop && above >= 4 ? above : position.y;
+	setStyleIfChanged('top', `${viewportTop + Math.max(4, Math.min(top, bottomAlignedTop))}px`);
 }
 
 export function trackPopupPosition(
 	doc: Document,
 	el: HTMLElement,
-	position: { x: number; y: number },
-): () => void {
+	position: PopupAnchor,
+): PopupPositioning {
 	const win = doc.defaultView ?? window;
-	const update = () => positionPopup(doc, el, position);
 	const viewport = win.visualViewport;
-	win.addEventListener('resize', update);
-	win.addEventListener('scroll', update, true);
-	doc.addEventListener('scroll', update, true);
-	viewport?.addEventListener('resize', update);
-	viewport?.addEventListener('scroll', update);
-	return () => {
-		win.removeEventListener('resize', update);
-		win.removeEventListener('scroll', update, true);
-		doc.removeEventListener('scroll', update, true);
-		viewport?.removeEventListener('resize', update);
-		viewport?.removeEventListener('scroll', update);
+	let disposed = false;
+	let frame = 0;
+	const beforeCallbacks = new Set<() => void>();
+	const afterCallbacks = new Set<() => void>();
+	const run = () => {
+		frame = 0;
+		if (disposed) return;
+		for (const callback of beforeCallbacks) callback();
+		beforeCallbacks.clear();
+		if (el.isConnected) positionPopup(doc, el, position);
+		for (const callback of afterCallbacks) callback();
+		afterCallbacks.clear();
+	};
+	const schedule = (beforePosition?: () => void, afterPosition?: () => void) => {
+		if (disposed) return;
+		if (beforePosition) beforeCallbacks.add(beforePosition);
+		if (afterPosition) afterCallbacks.add(afterPosition);
+		if (!frame) frame = win.requestAnimationFrame(run);
+	};
+	const reposition = (beforePosition?: () => void, afterPosition?: () => void) => {
+		if (disposed) return;
+		if (beforePosition) beforeCallbacks.add(beforePosition);
+		if (afterPosition) afterCallbacks.add(afterPosition);
+		if (frame) win.cancelAnimationFrame(frame);
+		frame = 0;
+		run();
+	};
+	const onResize = () => schedule();
+	const onScroll = () => schedule();
+	win.addEventListener('resize', onResize);
+	doc.addEventListener('scroll', onScroll, true);
+	viewport?.addEventListener('resize', onResize);
+	viewport?.addEventListener('scroll', onScroll);
+	return {
+		schedule,
+		reposition,
+		dispose() {
+			if (disposed) return;
+			disposed = true;
+			if (frame) win.cancelAnimationFrame(frame);
+			frame = 0;
+			beforeCallbacks.clear();
+			afterCallbacks.clear();
+			win.removeEventListener('resize', onResize);
+			doc.removeEventListener('scroll', onScroll, true);
+			viewport?.removeEventListener('resize', onResize);
+			viewport?.removeEventListener('scroll', onScroll);
+		},
 	};
 }
 
@@ -92,6 +151,7 @@ export function showIconPopup(
 	const row = el.createDiv({ cls: 'study-pdf-popup-row' });
 	for (const button of buttons) {
 		const btnEl = row.createEl('button', { cls: 'clickable-icon' });
+		btnEl.type = 'button';
 		if (button.type === 'color') {
 			const dot = btnEl.createSpan({ cls: 'study-pdf-color-dot' });
 			dot.setCssStyles({ backgroundColor: button.hex });
@@ -99,13 +159,14 @@ export function showIconPopup(
 			btnEl.setAttribute('aria-label', button.name);
 		} else {
 			setIcon(btnEl, button.icon);
+			btnEl.setAttribute('aria-label', button.label);
 			setTooltip(btnEl, button.label);
 		}
 		btnEl.addEventListener('click', button.onClick);
 	}
 
 	positionPopup(doc, el, position);
-	const stopPositionTracking = trackPopupPosition(doc, el, position);
+	const positioning = trackPopupPosition(doc, el, position);
 	let closed = false;
 	const onKeyDown = (evt: KeyboardEvent) => {
 		if (evt.key !== 'Escape') return;
@@ -115,7 +176,7 @@ export function showIconPopup(
 	const hide = () => {
 		if (closed) return;
 		closed = true;
-		stopPositionTracking();
+		positioning.dispose();
 		doc.removeEventListener('keydown', onKeyDown);
 		el.remove();
 		options.onDismiss?.();
@@ -125,7 +186,7 @@ export function showIconPopup(
 
 	return {
 		el,
-		reposition: () => positionPopup(doc, el, position),
+		reposition: () => positioning.schedule(),
 		preserveOnScroll: options.preserveOnScroll,
 		hide,
 	};
@@ -140,17 +201,30 @@ export function showNoteEditorPopup(
 	position: { x: number; y: number },
 	options: {
 		initial: string;
+		inputLabel?: string;
 		onSave: (note: string) => void | boolean | Promise<void | boolean>;
 		onSaved?: () => void;
 		onCancel: () => void;
 	},
 ): IconPopup {
-	const el = doc.body.createDiv({ cls: 'study-pdf-popup' });
+	const el = doc.body.createDiv({ cls: 'study-pdf-popup study-pdf-note-editor' });
+	doc.dispatchEvent(new Event('study-pdf-note-editor-open'));
+	el.setAttribute('role', 'dialog');
+	el.setAttribute('aria-label', 'Annotation note');
+	const popupPosition = { ...position };
 	el.tabIndex = -1;
 	let closed = false;
 	let composing = false;
+	let dictating = false;
 	let pending = false;
 	let savedCloseTimer = 0;
+
+	const handle = el.createEl('button', { cls: 'study-pdf-note-handle' });
+	handle.type = 'button';
+	handle.setAttribute('aria-label', 'Move note. Drag or use arrow keys.');
+	setTooltip(handle, 'Move note');
+	setIcon(handle, 'grip-horizontal');
+	let repositionPopup: () => void = () => undefined;
 
 	// createEl's `value` option only reflects for <input> elements, not
 	// <textarea> -- set it directly so an existing note is pre-filled.
@@ -158,12 +232,23 @@ export function showNoteEditorPopup(
 		cls: 'study-pdf-note-input',
 		placeholder: 'Note…',
 	});
-	input.setAttribute('aria-label', 'Highlight note');
+	input.setAttribute('aria-label', options.inputLabel ?? 'Highlight note');
 	input.value = options.initial;
+	const preview = el.createDiv({ cls: 'study-pdf-note-preview' });
+	preview.hidden = true;
+	const formatControls = createNoteFormattingControls(el, input, preview, {
+		reposition: () => repositionPopup(),
+		isComposing: () => composing,
+	});
+	// Existing longer notes remain readable/editable without silent truncation.
+	const wordLimit = Math.max(NOTE_WORD_LIMIT, countNoteWords(options.initial));
 
-	const row = el.createDiv({ cls: 'study-pdf-popup-row' });
+	const row = el.createDiv({ cls: 'study-pdf-popup-row study-pdf-note-footer' });
 	const status = row.createSpan({ cls: 'study-pdf-note-status' });
 	status.setAttribute('aria-live', 'polite');
+	const counter = row.createSpan({ cls: 'study-pdf-note-word-count' });
+	counter.id = `study-pdf-note-words-${++nextNoteCounterId}`;
+	input.setAttribute('aria-describedby', counter.id);
 	const setStatus = (state: 'idle' | 'pending' | 'saved' | 'failed') => {
 		status.empty();
 		status.removeAttribute('data-state');
@@ -172,24 +257,57 @@ export function showNoteEditorPopup(
 		setIcon(status, state === 'pending' ? 'loader-circle' : state === 'saved' ? 'check' : 'circle-alert');
 		status.setAttribute('aria-label', state === 'pending' ? 'Saving draft' : state === 'saved' ? 'Draft saved' : 'Save failed. Draft retained.');
 	};
-	const makeButton = (icon: string, label: string, onClick: () => void) => {
+	const makeButton = (icon: string, label: string, onClick?: () => void) => {
 		const btnEl = row.createEl('button', { cls: 'clickable-icon' });
+		btnEl.type = 'button';
 		setIcon(btnEl, icon);
 		setTooltip(btnEl, label);
 		btnEl.setAttribute('aria-label', label);
-		btnEl.addEventListener('click', onClick);
+		if (onClick) btnEl.addEventListener('click', onClick);
 		return btnEl;
 	};
+	const micButton = makeButton('mic', 'Dictate note');
+	micButton.classList.add('study-pdf-note-format-button');
 	const saveButton = makeButton('check', 'Save note', () => { void submit(); });
-	const cancelButton = makeButton('x', 'Cancel', options.onCancel);
+	const cancel = () => {
+		dictation.abort();
+		options.onCancel();
+	};
+	const cancelButton = makeButton('x', 'Cancel', cancel);
+	const dictationStatus = el.createDiv({ cls: 'study-pdf-popup-note study-pdf-note-footer' });
+	dictationStatus.setAttribute('role', 'status');
+	dictationStatus.hidden = true;
+	const syncEditingControls = () => {
+		const state = status.getAttribute('data-state');
+		micButton.disabled = composing || state === 'pending' || state === 'saved';
+		formatControls.setDisabled(micButton.disabled || dictating);
+	};
+	const dictation = bindNoteDictation(input, micButton, dictationStatus, {
+		canDictate: () => preview.hidden && !micButton.disabled,
+		onActiveChange(active) {
+			dictating = active;
+			syncEditingControls();
+		},
+		reposition: () => repositionPopup(),
+	});
+	const updateWordCount = () => {
+		const count = countNoteWords(input.value);
+		counter.setText(`${count} / ${wordLimit}`);
+		counter.setAttribute('aria-label', `${count} of ${wordLimit} words`);
+		counter.classList.toggle('is-over-limit', count > wordLimit);
+		input.setAttribute('aria-invalid', String(count > wordLimit));
+		saveButton.disabled = pending || status.getAttribute('data-state') === 'saved' || count > wordLimit;
+	};
 	const updateStatus = (state: 'idle' | 'pending' | 'saved' | 'failed') => {
 		setStatus(state);
-		saveButton.disabled = state === 'pending' || state === 'saved';
+		saveButton.disabled = state === 'pending' || state === 'saved' || countNoteWords(input.value) > wordLimit;
 		cancelButton.disabled = state === 'pending' || state === 'saved';
 		input.disabled = state === 'pending';
+		syncEditingControls();
 	};
 	const submit = async () => {
-		if (pending || closed) return;
+		if (pending || closed || status.getAttribute('data-state') === 'saved' || countNoteWords(input.value) > wordLimit) return;
+		dictation.abort();
 		pending = true;
 		updateStatus('pending');
 		try {
@@ -206,15 +324,23 @@ export function showNoteEditorPopup(
 		} finally {
 			pending = false;
 			if (!closed && status.getAttribute('data-state') !== 'failed' && status.getAttribute('data-state') !== 'saved') {
-				saveButton.disabled = false;
+				saveButton.disabled = countNoteWords(input.value) > wordLimit;
 				cancelButton.disabled = false;
 			}
 		}
 	};
 
-	input.addEventListener('compositionstart', () => { composing = true; });
-	input.addEventListener('compositionend', () => { composing = false; });
+	input.addEventListener('compositionstart', () => {
+		composing = true;
+		dictation.abort();
+		syncEditingControls();
+	});
+	input.addEventListener('compositionend', () => {
+		composing = false;
+		syncEditingControls();
+	});
 	input.addEventListener('input', () => {
+		updateWordCount();
 		const state = status.getAttribute('data-state');
 		if (state === 'failed' || state === 'saved') {
 			if (savedCloseTimer) doc.defaultView?.clearTimeout(savedCloseTimer);
@@ -232,7 +358,7 @@ export function showNoteEditorPopup(
 	const onKeyDown = (evt: KeyboardEvent) => {
 		if (evt.key !== 'Escape' || evt.isComposing || composing || evt.keyCode === 229 || pending) return;
 		evt.preventDefault();
-		options.onCancel();
+		cancel();
 	};
 	el.addEventListener('keydown', onKeyDown);
 
@@ -255,18 +381,27 @@ export function showNoteEditorPopup(
 	scope.register([], 'ArrowRight', () => true);
 	app.keymap.pushScope(scope);
 
-	positionPopup(doc, el, position);
-	const stopPositionTracking = trackPopupPosition(doc, el, position);
+	positionPopup(doc, el, popupPosition);
+	const positioning = trackPopupPosition(doc, el, popupPosition);
+	repositionPopup = () => positioning.reposition();
+	const stopDragging = bindPopupDragging(doc, el, handle, popupPosition, positioning);
+	const stopAutoSize = bindAutoNoteSize(doc, el, input, positioning);
+	updateWordCount();
 	input.focus();
 
 	return {
 		el,
-		reposition: () => positionPopup(doc, el, position),
+		reposition: () => positioning.schedule(),
+		preserveOnScroll: true,
+		get preserveOnBlur() { return dictating; },
 		hide() {
 			if (closed) return;
 			closed = true;
+			dictation.dispose();
 			if (savedCloseTimer) doc.defaultView?.clearTimeout(savedCloseTimer);
-			stopPositionTracking();
+			stopAutoSize();
+			stopDragging();
+			positioning.dispose();
 			el.removeEventListener('keydown', onKeyDown);
 			app.keymap.popScope(scope);
 			el.remove();

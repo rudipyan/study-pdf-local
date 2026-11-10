@@ -1,7 +1,7 @@
 {
 	"id": "study-pdf-local",
-	"name": "Study PDF Local",
-	"version": "0.5.0",
+	"name": "Rudi's Study PDF",
+	"version": "0.6.0",
 	"minAppVersion": "1.4.4",
 	"description": "Highlight PDFs with custom colors, edit comments, and export annotations and quotations.",
 	"author": "Rudi Sayat Pulatyan",

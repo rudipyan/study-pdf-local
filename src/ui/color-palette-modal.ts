@@ -1,29 +1,33 @@
-import { setTooltip } from 'obsidian';
+import { setIcon, setTooltip } from 'obsidian';
 import type { HighlightInfo, HighlightTarget, RgbColor } from '../annotate';
 import type { HighlightColorOption } from '../color-palette';
 import { candidateAccessibleLabel, defaultFirstColors } from '../palette-editor';
-import { positionPopup, trackPopupPosition, type IconPopup } from './icon-popup';
+import { positionPopup, trackPopupPosition, type IconPopup, type PopupAnchor } from './icon-popup';
+import { ANNOTATION_ACTIONS_OPEN_EVENT } from './note-hover-preview';
+import { canCopyHighlight } from '../pdf-highlight-copy';
 
-export interface CandidateChoice extends Pick<HighlightInfo, 'target' | 'note' | 'quote' | 'currentColor' | 'unsupportedReason'> {
+export interface CandidateChoice extends HighlightInfo {
 	pageIndex: number;
 }
 
 export interface CandidateChoiceActions {
 	onRecolor(target: HighlightTarget, color: RgbColor): void;
 	onEditNote(candidate: CandidateChoice): void;
+	onCopy(candidate: CandidateChoice): void;
 	onRemove(candidate: CandidateChoice): void;
 	onDismiss?(): void;
 }
 
 export function showColorPaletteModal(
 	doc: Document,
-	position: { x: number; y: number },
+	position: PopupAnchor,
 	candidates: readonly CandidateChoice[],
 	colors: readonly HighlightColorOption[],
 	defaultColorId: string,
 	actions: CandidateChoiceActions,
 ): IconPopup {
 	const el = doc.body.createDiv({ cls: 'study-pdf-popup study-pdf-candidate-modal' });
+	doc.dispatchEvent(new Event(ANNOTATION_ACTIONS_OPEN_EVENT));
 	el.setAttribute('role', 'dialog');
 	el.setAttribute('aria-label', 'Annotation actions');
 	el.tabIndex = -1;
@@ -51,12 +55,29 @@ export function showColorPaletteModal(
 		const actionRow = item.createDiv({ cls: 'study-pdf-candidate-actions' });
 		const canAddressTarget = candidate.target !== null;
 		const noteLabel = candidate.note?.trim() ? 'Edit note' : 'Add note';
-		const note = actionRow.createEl('button', { text: noteLabel });
+		const textActions = actionRow.createDiv({ cls: 'study-pdf-candidate-text-actions' });
+		textActions.setAttribute('role', 'group');
+		textActions.setAttribute('aria-label', `Text actions for ${candidateLabel}`);
+		const note = textActions.createEl('button', { cls: 'study-pdf-comment-tool' });
 		note.type = 'button';
 		note.disabled = !canAddressTarget;
 		note.setAttribute('aria-label', `${noteLabel} for ${candidateLabel}`);
+		setTooltip(note, `${noteLabel} for ${candidateLabel}`);
+		setIcon(note, 'message-square');
 		note.addEventListener('click', () => {
 			if (candidate.target) actions.onEditNote(candidate);
+		});
+		const copy = textActions.createEl('button');
+		copy.type = 'button';
+		const canCopy = canCopyHighlight(candidate);
+		copy.disabled = !canCopy;
+		copy.setAttribute('aria-label', candidate.regionBox ? `Copy selected area for ${candidateLabel}` : canCopy
+			? `Copy highlighted text for ${candidateLabel}`
+			: `Copy unavailable for ${candidateLabel}: no highlighted text`);
+		setTooltip(copy, candidate.regionBox ? 'Copy selected area' : canCopy ? 'Copy highlighted text' : 'No highlighted text to copy');
+		setIcon(copy, 'copy');
+		copy.addEventListener('click', () => {
+			if (canCopy) actions.onCopy(candidate);
 		});
 
 		const colorRow = actionRow.createDiv({ cls: 'study-pdf-candidate-color-options' });
@@ -73,7 +94,9 @@ export function showColorPaletteModal(
 			const dot = colorButton.createSpan({ cls: 'study-pdf-color-dot' });
 			dot.setCssStyles({ backgroundColor: color.hex });
 			colorButton.addEventListener('click', () => {
-				if (candidate.target && !candidate.unsupportedReason) actions.onRecolor(candidate.target, { ...colorToRgb(color.hex) });
+				if (candidate.target && !colorButton.disabled) {
+					actions.onRecolor(candidate.target, colorToRgb(color.hex));
+				}
 			});
 		}
 
@@ -90,7 +113,7 @@ export function showColorPaletteModal(
 
 	}
 	positionPopup(doc, el, position);
-	const stopPositionTracking = trackPopupPosition(doc, el, position);
+	const positioning = trackPopupPosition(doc, el, position);
 	let closed = false;
 	const onKeyDown = (event: KeyboardEvent) => {
 		if (event.key !== 'Escape') return;
@@ -100,13 +123,13 @@ export function showColorPaletteModal(
 	const hide = () => {
 		if (closed) return;
 		closed = true;
-		stopPositionTracking();
+		positioning.dispose();
 		doc.removeEventListener('keydown', onKeyDown);
 		el.remove();
 		actions.onDismiss?.();
 	};
 	doc.addEventListener('keydown', onKeyDown);
-	return { el, preserveOnScroll: true, reposition: () => positionPopup(doc, el, position), hide };
+	return { el, preserveOnScroll: true, reposition: () => positioning.schedule(), hide };
 }
 
 function colorToRgb(hex: string): RgbColor {

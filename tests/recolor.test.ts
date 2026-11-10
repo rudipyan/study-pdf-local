@@ -521,6 +521,70 @@ describe('safe PDF highlight recoloring', () => {
 		expect(changedDict.get(PDFName.of('AP'))?.toString()).not.toBe(untouchedDict.get(PDFName.of('AP'))?.toString());
 		expect(readNormalAppearance(after, untouchedDict).text).toContain(`${YELLOW.r} ${YELLOW.g} ${YELLOW.b} rg`);
 	});
+
+	it('rebuilds a filtered appearance on recolor and keeps a shared original intact', async () => {
+		const bytes = await addHighlightAnnotation(await fixture(), {
+			pageIndex: 0, ...SLANTED, color: YELLOW, opacity: 0.4, quote: 'original quote',
+		});
+		const doc = await PDFDocument.load(bytes);
+		const annots = doc.getPage(0).node.lookup(PDFName.of('Annots'), PDFArray);
+		const ref = annots.get(0) as PDFRef;
+		const highlight = doc.context.lookup(ref, PDFDict);
+		highlight.set(PDFName.of('Contents'), PDFHexString.fromText('original note'));
+		const original = readNormalAppearance(doc, highlight);
+		const filtered = doc.context.flateStream(`q\n${original.text}\nQ`);
+		for (const [key, value] of original.stream.dict.entries()) {
+			if (key.toString() !== '/Length') filtered.dict.set(key, value);
+		}
+		const filteredRef = doc.context.register(filtered);
+		const sharedAp = doc.context.register(doc.context.obj({ N: filteredRef }));
+		highlight.set(PDFName.of('AP'), sharedAp);
+		annots.push(doc.context.register(highlight.clone(doc.context)));
+		const source = await doc.save();
+
+		const probe = { x: 52, y: 35 };
+		const candidates = findHighlightsInIndexAtPoint(await buildHighlightIndex(source), 0, probe);
+		expect(candidates[0]).toMatchObject({ unsupportedReason: null });
+		const target = candidates[0]!.target!;
+		const same = await setHighlightColorAt(source, { ...target, color: YELLOW });
+		expect(same.updatedCount).toBe(0);
+		expect(same.bytes).toBe(source);
+
+		const changed = await setHighlightColorAt(source, { ...target, color: BLUE });
+		expect(changed.updatedCount).toBe(1);
+		expect(changed.target.objectNumber).toBe(ref.objectNumber);
+		const after = await PDFDocument.load(changed.bytes);
+		const saved = after.context.lookup(ref, PDFDict);
+		expect(saved.get(PDFName.of('QuadPoints'))?.toString()).toBe(highlight.get(PDFName.of('QuadPoints'))?.toString());
+		expect((saved.get(PDFName.of('Contents')) as PDFHexString).decodeText()).toBe('original note');
+		expect((saved.get(PDFName.of('StudyPDFQuote')) as PDFHexString).decodeText()).toBe('original quote');
+		const appearance = readNormalAppearance(after, saved);
+		expect(appearance.text).toContain(`${BLUE.r} ${BLUE.g} ${BLUE.b} rg`);
+		expect(appearance.text).toMatch(/0 20 m\n60 30 l\n65 10 l\n5 0 l\nh\nf/);
+		expect(appearance.ca).toBe(0.4);
+		expect(appearance.stream.dict.has(PDFName.of('Filter'))).toBe(false);
+
+		const neighbor = after.context.lookup(after.getPage(0).node.lookup(PDFName.of('Annots'), PDFArray).get(1), PDFDict);
+		expect(neighbor.get(PDFName.of('AP'))).toBe(sharedAp);
+		expect(readNormalAppearance(after, neighbor).stream.getContents()).toEqual(filtered.getContents());
+		expect((await findHighlightsAtPoint(changed.bytes, 0, probe))[0]).toMatchObject({ unsupportedReason: null });
+	});
+
+	it('does not override a filtered appearance with an alternate state', async () => {
+		const bytes = await addHighlightAnnotation(await fixture(), { pageIndex: 0, ...SLANTED, color: YELLOW });
+		const doc = await PDFDocument.load(bytes);
+		const ref = doc.getPage(0).node.lookup(PDFName.of('Annots'), PDFArray).get(0);
+		const highlight = doc.context.lookup(ref, PDFDict);
+		const ap = highlight.lookup(PDFName.of('AP'), PDFDict);
+		const filteredRef = doc.context.register(doc.context.flateStream('q Q', { Type: 'XObject', Subtype: 'Form' }));
+		ap.set(PDFName.of('N'), filteredRef);
+		ap.set(PDFName.of('R'), filteredRef);
+		const source = await doc.save();
+		const [candidate] = await findHighlightsAtPoint(source, 0, { x: 52, y: 35 });
+		expect(candidate!.unsupportedReason).toMatch(/alternate appearance states/);
+		await expect(setHighlightColorAt(source, { ...candidate!.target!, color: BLUE }))
+			.rejects.toThrow(/alternate appearance states/);
+	});
 });
 
 describe('exact-target annotation actions', () => {

@@ -27,6 +27,7 @@ export function createPdfReadingLayout(initialView: PdfReadingLayoutView): PdfRe
 	let frameId: number | null = null;
 	let secondPinchFrameId: number | null = null;
 	let disposed = false;
+	let clippingAncestors: HTMLElement[] | null = null;
 	let touchPinchActive = false;
 	let pointerPinchActive = false;
 	const touchPointerIds = new Set<number>();
@@ -37,19 +38,21 @@ export function createPdfReadingLayout(initialView: PdfReadingLayoutView): PdfRe
 	const ResizeObserverConstructor = ownerWindow?.ResizeObserver;
 	const MutationObserverConstructor = ownerWindow?.MutationObserver;
 	const resizeObserver = ResizeObserverConstructor
-		? new ResizeObserverConstructor(() => scheduleRefresh())
+		? new ResizeObserverConstructor(() => { clippingAncestors = null; scheduleRefresh(); })
 		: null;
 	let attachScrollElement: (next: HTMLElement | null) => void = () => {};
 	let observePageContainer: () => void = () => {};
 	let observeScrollParent: () => void = () => {};
 	const mutationObserver = MutationObserverConstructor
 		? new MutationObserverConstructor(() => {
+			if (disposed) return;
 			observePageContainer();
 			scheduleRefresh();
 		})
 		: null;
 	const scrollParentObserver = MutationObserverConstructor
 		? new MutationObserverConstructor(() => {
+			if (disposed) return;
 			const nextScrollEl = view.getPdfScrollElement();
 			if (nextScrollEl !== scrollEl) attachScrollElement(nextScrollEl);
 			else {
@@ -70,7 +73,7 @@ export function createPdfReadingLayout(initialView: PdfReadingLayoutView): PdfRe
 		if (locked && scrollEl.scrollLeft !== 0) scrollEl.scrollLeft = 0;
 	};
 
-	const visiblePages = (): HTMLElement[] => {
+	const visiblePages = (): { page: HTMLElement; rect: DOMRect }[] => {
 		if (!scrollEl) return [];
 		const viewport = scrollEl.getBoundingClientRect();
 		const centerX = viewport.left + scrollEl.clientLeft + scrollEl.clientWidth / 2;
@@ -95,12 +98,12 @@ export function createPdfReadingLayout(initialView: PdfReadingLayoutView): PdfRe
 				if (number > 0 && (pageCount <= 0 || number <= pageCount)) numbers.add(number);
 			}
 		}
-		const pages: HTMLElement[] = [];
+		const pages: { page: HTMLElement; rect: DOMRect }[] = [];
 		for (const number of numbers) {
 			const page = view.getRenderedPageElement(number - 1);
-			if (!page || pages.includes(page)) continue;
+			if (!page || pages.some((entry) => entry.page === page)) continue;
 			const rect = page.getBoundingClientRect();
-			if (rect.bottom > viewport.top && rect.top < viewport.bottom) pages.push(page);
+			if (rect.bottom > viewport.top && rect.top < viewport.bottom) pages.push({ page, rect });
 		}
 		return pages;
 	};
@@ -114,15 +117,20 @@ export function createPdfReadingLayout(initialView: PdfReadingLayoutView): PdfRe
 			left = Math.max(left, 0);
 			right = Math.min(right, ownerWindow.innerWidth);
 		}
-		let ancestor = scrollEl.parentElement;
-		while (ancestor && ancestor !== scrollEl.ownerDocument.documentElement) {
-			const overflowX = ownerWindow?.getComputedStyle(ancestor).overflowX;
-			if (overflowX && overflowX !== 'visible') {
-				const ancestorRect = ancestor.getBoundingClientRect();
-				left = Math.max(left, ancestorRect.left + ancestor.clientLeft);
-				right = Math.min(right, ancestorRect.left + ancestor.clientLeft + ancestor.clientWidth);
+		if (clippingAncestors === null) {
+			clippingAncestors = [];
+			let ancestor = scrollEl.parentElement;
+			while (ancestor && ancestor !== scrollEl.ownerDocument.documentElement) {
+				const overflowX = ownerWindow?.getComputedStyle(ancestor).overflowX;
+				if (overflowX && overflowX !== 'visible') clippingAncestors.push(ancestor);
+				ancestor = ancestor.parentElement;
 			}
-			ancestor = ancestor.parentElement;
+		}
+		// Keep rectangles live: pane positions can change without resizing.
+		for (const ancestor of clippingAncestors) {
+			const ancestorRect = ancestor.getBoundingClientRect();
+			left = Math.max(left, ancestorRect.left + ancestor.clientLeft);
+			right = Math.min(right, ancestorRect.left + ancestor.clientLeft + ancestor.clientWidth);
 		}
 		return right > left ? { left, right } : null;
 	};
@@ -156,14 +164,18 @@ export function createPdfReadingLayout(initialView: PdfReadingLayoutView): PdfRe
 
 	const refreshNow = () => {
 		if (disposed || !scrollEl) return;
-		const pages = visiblePages();
-		observeVisiblePages(pages);
-		const bounds = visibleHorizontalBounds();
-		if (pointerPinchActive || touchPinchActive || pages.length === 0 || !bounds) {
+		if (pointerPinchActive || touchPinchActive) {
 			setHorizontalLock(false);
 			return;
 		}
-		const rects = pages.map((page) => page.getBoundingClientRect());
+		const pages = visiblePages();
+		observeVisiblePages(pages.map(({ page }) => page));
+		const bounds = visibleHorizontalBounds();
+		if (pages.length === 0 || !bounds) {
+			setHorizontalLock(false);
+			return;
+		}
+		const rects = pages.map(({ rect }) => rect);
 		const left = Math.min(...rects.map((rect) => rect.left));
 		const right = Math.max(...rects.map((rect) => rect.right));
 		const fits = right - left <= bounds.right - bounds.left + PAGE_WIDTH_TOLERANCE_PX &&
@@ -224,9 +236,10 @@ export function createPdfReadingLayout(initialView: PdfReadingLayoutView): PdfRe
 			schedulePinchRecheck();
 		}
 	};
-	const onResize = () => scheduleRefresh();
+	const onResize = () => { clippingAncestors = null; scheduleRefresh(); };
 
 	attachScrollElement = (next: HTMLElement | null) => {
+		clippingAncestors = null;
 		if (scrollEl === next) return;
 		if (secondPinchFrameId !== null) ownerWindow?.cancelAnimationFrame(secondPinchFrameId);
 		secondPinchFrameId = null;
@@ -277,7 +290,7 @@ export function createPdfReadingLayout(initialView: PdfReadingLayoutView): PdfRe
 			attachScrollElement(nextView.getPdfScrollElement());
 			scheduleRefresh();
 		},
-		refresh: scheduleRefresh,
+		refresh() { clippingAncestors = null; scheduleRefresh(); },
 		dispose() {
 			if (disposed) return;
 			disposed = true;

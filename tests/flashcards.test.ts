@@ -116,6 +116,83 @@ describe('mergeFlashcardNote', () => {
 		expect(out.kept).toBe(1);
 	});
 
+	it('matches annotation IDs exactly when one ID is a prefix of another', () => {
+		const existing = [
+			FLASHCARD_TAG,
+			'',
+			'## Page 1',
+			'',
+			'Question for 12R1 :: Long answer [[x#page=1&annotation=12R1|p. 1]]',
+			'<!--SR:!2026-01-02,7,250-->',
+			'',
+			'Question for 12R :: Short answer [[x#page=1&annotation=12R|p. 1]]',
+			'<!--SR:!2026-03-04,21,280-->',
+			'',
+		].join('\n');
+		const out = mergeFlashcardNote(existing, [
+			block('annotation=12R', 'Question for 12R :: Short answer [[x#page=1&annotation=12R|p. 1]]'),
+			block('annotation=12R1', 'Question for 12R1 :: Long answer [[x#page=1&annotation=12R1|p. 1]]'),
+		]);
+
+		expect(out).toMatchObject({ added: 0, kept: 2, updated: 0, orphaned: 0 });
+		expect(out.content).toContain('Question for 12R1 :: Long answer [[x#page=1&annotation=12R1|p. 1]]\n<!--SR:!2026-01-02,7,250-->');
+		expect(out.content).toContain('Question for 12R :: Short answer [[x#page=1&annotation=12R|p. 1]]\n<!--SR:!2026-03-04,21,280-->');
+	});
+
+	it('orphans only the removed card when annotation IDs share a prefix', () => {
+		const existing = [
+			FLASHCARD_TAG,
+			'',
+			'## Page 1',
+			'',
+			'Question for 12R1 :: Long answer [[x#page=1&annotation=12R1|p. 1]]',
+			'<!--SR:!2026-01-02,7,250-->',
+			'',
+			'Question for 12R :: Short answer [[x#page=1&annotation=12R|p. 1]]',
+			'<!--SR:!2026-03-04,21,280-->',
+			'',
+		].join('\n');
+		const out = mergeFlashcardNote(existing, [
+			block('annotation=12R', 'Question for 12R :: Short answer [[x#page=1&annotation=12R|p. 1]]'),
+		]);
+
+		expect(out).toMatchObject({ added: 0, kept: 1, updated: 0, orphaned: 1 });
+		expect(out.content).toContain('Question for 12R :: Short answer [[x#page=1&annotation=12R|p. 1]]\n<!--SR:!2026-03-04,21,280-->');
+		expect(out.content).toContain('## Orphaned\n\nQuestion for 12R1 :: Long answer [[x#page=1&annotation=12R1|p. 1]]\n<!--SR:!2026-01-02,7,250-->');
+	});
+
+	it('does not match an annotation ID mentioned in another card question', () => {
+		const existing = `${FLASHCARD_TAG}\n\n## Page 1\n\nQuestion mentions annotation=12R1 :: Answer [[x#page=1&annotation=12R|p. 1]]\n<!--SR:!2026-01-02,7,250-->\n`;
+		const out = mergeFlashcardNote(existing, [
+			block('annotation=12R1', 'New question :: New answer [[x#page=1&annotation=12R1|p. 1]]'),
+		]);
+
+		expect(out).toMatchObject({ added: 1, kept: 0, updated: 0, orphaned: 1 });
+		expect(out.content).toContain('## Orphaned\n\nQuestion mentions annotation=12R1 :: Answer [[x#page=1&annotation=12R|p. 1]]\n<!--SR:!2026-01-02,7,250-->');
+		expect(out.content).toContain('New question :: New answer [[x#page=1&annotation=12R1|p. 1]]');
+	});
+
+	it('reuses only an exact page-only card and preserves its review schedule', () => {
+		const card = block('The answer text', 'Question :: Answer [[x#page=1|p. 1]]');
+		const first = mergeFlashcardNote(null, [card]);
+		const scheduled = first.content.replace(`${card.block}\n`, `${card.block}\n<!--SR:!2026-04-05,7,250-->\n`);
+		const second = mergeFlashcardNote(scheduled, [card]);
+
+		expect(second.content).toBe(scheduled);
+		expect(second).toMatchObject({ added: 0, kept: 1, updated: 0, orphaned: 0 });
+		expect(second.content).toContain(`${card.block}\n<!--SR:!2026-04-05,7,250-->`);
+	});
+
+	it('leaves changed page-only cards untouched rather than rewriting or orphaning them', () => {
+		const previous = 'Old wording :: Answer [[x#page=1|p. 1]]';
+		const existing = `${FLASHCARD_TAG}\n\n## Page 1\n\n${previous}\n<!--SR:!2026-04-05,7,250-->\n`;
+		const out = mergeFlashcardNote(existing, [block('The answer text', 'New wording :: Answer [[x#page=1|p. 1]]')]);
+
+		expect(out).toMatchObject({ added: 1, kept: 0, updated: 0, orphaned: 0 });
+		expect(out.content).toContain(`${previous}\n<!--SR:!2026-04-05,7,250-->`);
+		expect(out.content).toContain('New wording :: Answer [[x#page=1|p. 1]]');
+	});
+
 	it('appends a genuinely new card under its page heading', () => {
 		const existing = [
 			FLASHCARD_TAG,

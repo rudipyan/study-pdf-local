@@ -157,22 +157,38 @@ function renderNote(sections: Section[]): string {
 	return `${parts.join('\n\n')}\n`;
 }
 
-/** Identifies chunks this file wrote: card syntax plus an annotation link.
- * Used only to decide what may be moved to `## Orphaned`, so it deliberately
- * requires both -- a paragraph of the user's own that merely happens to quote
- * an annotation link is left where it is. Cards for highlights with no
- * annotation id (keyed by their quote instead) aren't recognised here and so
- * are never orphaned; they are simply left in place. */
-function isOurCard(chunk: Chunk): boolean {
-	const text = chunkText(chunk);
-	const hasCardSyntax =
-		text.includes(SINGLE_LINE_SEPARATOR) || chunk.lines.some((line) => line.trim() === MULTI_LINE_SEPARATOR);
-	// A generated answer ends at its annotation link. Trailing handwritten
-	// prose makes the boundary ambiguous, so leave that chunk untouched.
+interface GeneratedCardLink {
+	pageNumber: number;
+	annotationId: string | null;
+}
+
+/** Extracts the target from the final generated answer link, never from the
+ * question text, which may itself mention an annotation identifier. */
+function finalGeneratedCardLink(chunk: Chunk): GeneratedCardLink | null {
 	const bodyLines = chunk.lines.filter((line) => !SCHEDULE_LINE.test(line.trim()));
 	const lastLine = bodyLines[bodyLines.length - 1]?.trim() ?? '';
-	const endsAtAnnotationLink = /(?:\[\[[^\n]*annotation=[A-Za-z0-9]+[^\n]*\]\]|\[[^\n]*\]\([^\n]*annotation=[A-Za-z0-9]+[^\n]*\))$/.test(lastLine);
-	return hasCardSyntax && endsAtAnnotationLink;
+	const wiki = /^.*\[\[([^\]\n]+)\]\]$/.exec(lastLine);
+	const markdown = wiki ? null : /^.*\[[^\]\n]*\]\(([^)\n]+)\)$/.exec(lastLine);
+	const target = wiki?.[1]?.split('|', 1)[0] ?? markdown?.[1] ?? null;
+	if (!target) return null;
+	const page = /#page=(\d+)(?:&|$)/.exec(target);
+	if (!page) return null;
+	const annotation = /(?:[?&])annotation=([^&#\s|)\]]+)/.exec(target);
+	return { pageNumber: Number(page[1]), annotationId: annotation?.[1] ?? null };
+}
+
+function hasCardSyntax(chunk: Chunk): boolean {
+	const text = chunkText(chunk);
+	return text.includes(SINGLE_LINE_SEPARATOR) || chunk.lines.some((line) => line.trim() === MULTI_LINE_SEPARATOR);
+}
+
+function annotationIdFromKey(key: string): string | null {
+	const match = /^(?:#page=\d+&)?annotation=([^&#\s|)\]]+)$/.exec(key);
+	return match?.[1] ?? null;
+}
+
+function cardBody(chunk: Chunk): string {
+	return chunk.lines.filter((line) => !SCHEDULE_LINE.test(line.trim())).join('\n');
 }
 
 /** Replaces a card's own lines with new text, keeping its schedule line. */
@@ -246,10 +262,14 @@ export function mergeFlashcardNote(
 	let orphaned = 0;
 
 	/** Every card currently in the note, with where it sits. */
-	const placed: { chunk: Chunk; section: Section }[] = [];
+	const placed: { chunk: Chunk; section: Section; annotationId: string }[] = [];
+	const pageOnly: { chunk: Chunk; section: Section }[] = [];
 	for (const section of sections) {
 		for (const chunk of section.chunks) {
-			if (isOurCard(chunk)) placed.push({ chunk, section });
+			if (!hasCardSyntax(chunk)) continue;
+			const link = finalGeneratedCardLink(chunk);
+			if (link?.annotationId) placed.push({ chunk, section, annotationId: link.annotationId });
+			else if (link) pageOnly.push({ chunk, section });
 		}
 	}
 
@@ -257,7 +277,12 @@ export function mergeFlashcardNote(
 
 	for (const block of blocks) {
 		const heading = pageHeading(block.pageNumber);
-		const found = placed.find(({ chunk }) => chunkText(chunk).includes(block.key));
+		const annotationId = annotationIdFromKey(block.key);
+		if (!annotationId && pageOnly.some(({ chunk, section }) => section.heading === heading && cardBody(chunk) === block.block)) {
+			kept++;
+			continue;
+		}
+		const found = annotationId ? placed.find((card) => card.annotationId === annotationId) : undefined;
 
 		if (!found) {
 			sectionFor(sections, heading).chunks.push({ lines: block.block.split('\n') });
@@ -266,7 +291,7 @@ export function mergeFlashcardNote(
 		}
 
 		matched.add(found.chunk);
-		const isCurrent = chunkText(found.chunk).startsWith(block.block);
+		const isCurrent = cardBody(found.chunk) === block.block;
 		// A card sitting under `## Orphaned` whose highlight came back belongs in
 		// its page section again -- that move is what makes an orphaning
 		// reversible rather than a one-way trip.

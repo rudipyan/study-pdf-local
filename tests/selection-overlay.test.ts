@@ -31,6 +31,19 @@ describe('normalizeOverlayRects', () => {
 		expect(normalizeOverlayRects(input)).toEqual([rect(10, 100, 80, 20)]);
 	});
 
+	it('merges all transitively connected same-line rects regardless of input order', () => {
+		const input = [rect(20, 10, 10, 20), rect(0, 10, 10, 20), rect(8, 10, 14, 20)];
+
+		expect(normalizeOverlayRects(input)).toEqual([rect(0, 10, 30, 20)]);
+		expect(input).toEqual([rect(20, 10, 10, 20), rect(0, 10, 10, 20), rect(8, 10, 14, 20)]);
+	});
+
+	it('merges duplicate same-line rectangles into one without bridging separate columns', () => {
+		expect(normalizeOverlayRects([
+			rect(10, 100, 50, 20), rect(10, 100, 50, 20), rect(200, 100, 50, 20),
+		])).toEqual([rect(10, 100, 50, 20), rect(200, 100, 50, 20)]);
+	});
+
 	it('keeps rects on different lines separate', () => {
 		const input = [rect(10, 100, 50, 20), rect(10, 130, 50, 20)];
 

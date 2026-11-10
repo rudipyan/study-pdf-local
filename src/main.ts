@@ -1,17 +1,27 @@
-import { Component, FileView, Notice, Platform, Plugin, TFile, setIcon, setTooltip } from 'obsidian';
+import { Component, FileView, Notice, Platform, Plugin, TFile } from 'obsidian';
 import {
 	getActivePdfView,
 	getAllPdfViews,
 	patchNativeAnnotationPopup,
 	type ActivePdfView,
+	type PdfNoteLayerWatcher,
 } from './obsidian-pdf-internals';
 import { fingerprintPdfBytes, type InPlacePdfWriteToken } from './pdf-in-place';
 import type { PdfUpdatePreview } from './pdf-update-preview';
-import { showNoteEditorPopup, type IconPopup } from './ui/icon-popup';
-import { createAnnotationToolbar, type AnnotationToolbar } from './ui/annotation-toolbar';
+import { showNoteEditorPopup, type IconPopup, type PopupAnchor } from './ui/icon-popup';
+import { PomodoroTimer } from './pomodoro';
+import { PomodoroChime } from './pomodoro-chime';
+import { showPomodoroPopup } from './ui/pomodoro';
+import { createAnnotationToolbar, restoreNativePdfToolbarControls, type AnnotationToolbar } from './ui/annotation-toolbar';
 import { showReloadCurtain, type CurtainPaint } from './ui/reload-curtain';
 import { preserveReadingPosition } from './preserve-reading-position';
-import { createSelectionOverlay, type SelectionOverlay } from './ui/selection-overlay';
+import { createSelectionOverlay, liveSelectionOverlayRects, type SelectionOverlay } from './ui/selection-overlay';
+import { NoteMarkerPositions } from './note-marker-positions';
+import { updateNoteMarkers, disposeNoteMarkers } from './ui/note-markers';
+import { createRegionSelection, type RegionSelectionController, type SelectedPdfRegion } from './ui/region-selection';
+import { copyPdfRegionImage } from './pdf-region-copy';
+import { canCopyHighlight, copyPdfHighlightText } from './pdf-highlight-copy';
+import { createPdfLinkReturn, type PdfLinkReturnController } from './pdf-link-return';
 import { showHighlightPreview, letPreviewPaint } from './ui/highlight-preview';
 import { shouldKeepPressForGesture } from './tap-gesture';
 import {
@@ -19,9 +29,9 @@ import {
 	clearPencilTextSelection,
 	extendPencilTextSelection,
 	findRenderedTextLayer,
+	hasPencilDragDistance,
 	type PencilTextSelection,
 } from './pencil-gesture';
-import { shouldReplacePendingUpdate, type SelectionUpdateMode } from './selection-scheduler';
 import { HighlightListModal } from './ui/highlights-modal';
 import {
 	clientRectToPageLocal,
@@ -34,7 +44,9 @@ import {
 	type PdfViewportLike,
 } from './geometry';
 import {
+	replaceOverlappingHighlightAnnotations,
 	addHighlightAnnotations,
+	addPageNote,
 	buildHighlightIndex,
 	getVerifiedHighlightState,
 	findHighlightsInIndexAtPoint,
@@ -42,6 +54,7 @@ import {
 	setHighlightColorAt,
 	setHighlightNoteForTarget,
 	reinspectHighlightTarget,
+	configurePdfWorkScheduling,
 	type HighlightIndex,
 	type HighlightTarget,
 	type RgbColor,
@@ -90,6 +103,12 @@ import {
 } from './pdf-annotation-history';
 import { classifyPdfKeyboardShortcut, isPotentialPdfKeyboardShortcut } from './pdf-keyboard-shortcuts';
 import { createPdfReadingLayout, type PdfReadingLayoutController } from './pdf-reading-layout';
+import {
+	clearPdfReadingAppearance,
+	setPdfReadingAppearance,
+	type PdfReadingAppearance,
+} from './pdf-reading-appearance';
+import { showReadingAppearancePopup } from './ui/reading-appearance-popup';
 
 /** How far from the selection a touch may land and still count as "on" it --
  * covers the leading between line boxes and releasing a drag a hair past the
@@ -99,12 +118,27 @@ const SELECTION_HIT_SLOP_PX = 6;
 interface SelectionContext {
 	capture: CapturedPdfTarget<TFile, ActivePdfView>;
 	pdfView: ActivePdfView;
+	range?: Range;
 	segments: SelectionPageSegment[];
 	/** The exact selected text, captured while the DOM selection is still live
 	 * -- stored with the highlight so the list/copy features can show precisely
 	 * what was highlighted instead of reconstructing it from PDF geometry (see
 	 * pdf-text-extraction.ts's extractQuote for why that's only a fallback). */
 	text: string;
+	isRegion?: boolean;
+}
+
+interface SelectionSnapshot {
+	anchorNode: Node | null;
+	anchorOffset: number;
+	focusNode: Node | null;
+	focusOffset: number;
+}
+
+interface OwnedNativeSelection {
+	pdfView: ActivePdfView;
+	selection: Selection;
+	range: Range;
 }
 
 interface SelectionPageSegment {
@@ -137,9 +171,12 @@ interface ActivePencilGesture {
 }
 
 interface AnnotationToolbarState {
+	regionSelection: RegionSelectionController | null;
 	toolbar: AnnotationToolbar;
 	colorId: string;
 	highlighting: boolean;
+	appearance: PdfReadingAppearance;
+	appearanceContainer: HTMLElement | null;
 	file: TFile | null;
 }
 
@@ -158,7 +195,6 @@ interface PdfFocusModeState {
 	leafEl: HTMLElement;
 	toolbar: AnnotationToolbar;
 	toolbarObserver: MutationObserver | null;
-	showTools: boolean;
 	returnFocusEl: HTMLElement | null;
 }
 
@@ -204,7 +240,7 @@ function isEditableElement(element: Element | null): boolean {
 }
 
 function hasIgnoredShortcutContext(document: Document, elements: readonly Element[], activeElement: Element | null): boolean {
-	const selector = '.modal, .modal-container, .prompt, .suggestion-container, .suggestion-item, .search-input-container, .search-suggest-container, .menu';
+	const selector = '.modal, .modal-container, .prompt, .suggestion-container, .suggestion-item, .search-input-container, .search-suggest-container, .menu, .study-pdf-note-marker, .study-pdf-link-return';
 	return document.querySelector('.modal-container, [aria-modal="true"], dialog[open], .prompt') !== null ||
 		elements.some((element) => Boolean(element.closest(selector))) || Boolean(activeElement?.closest(selector));
 }
@@ -215,39 +251,118 @@ function selectionSegmentsForRange(pdfView: ActivePdfView, range: Range): Select
 	const showText = view?.NodeFilter.SHOW_TEXT ?? 4;
 	const startToStart = view?.Range.START_TO_START ?? 0;
 	const endToEnd = view?.Range.END_TO_END ?? 2;
-	const walker = doc.createTreeWalker(pdfView.containerEl, showText);
 	const groups = new Map<number, { text: string[]; rects: DOMRect[]; viewport: PdfViewportLike; textLayer: HTMLElement }>();
-	const pageElements = new Map<number, HTMLElement | null>();
-	const pageViewports = new Map<number, PdfViewportLike>();
-	let current = walker.nextNode();
-	while (current) {
-		const textNode = current as Text;
-		let intersects = false;
-		try { intersects = range.intersectsNode(textNode); } catch { /* Ignore a detached text node. */ }
-		if (intersects && textNode.data.length > 0) {
-			const pageIndex = pdfView.findPageIndexForNode(textNode);
-			if (pageIndex === null) {
-				current = walker.nextNode();
-				continue;
+	const startPageIndex = pdfView.findPageIndexForNode(range.startContainer);
+	const endPageIndex = pdfView.findPageIndexForNode(range.endContainer);
+	if (!pdfView.containerEl.contains(range.startContainer) || !pdfView.containerEl.contains(range.endContainer)) return null;
+	const containingTextLayer = (node: Node) => {
+		const element = node.nodeType === 1 ? node as Element : node.parentElement;
+		return element?.closest<HTMLElement>('.textLayer') ?? null;
+	};
+	const startTextLayer = containingTextLayer(range.startContainer);
+	const endTextLayer = containingTextLayer(range.endContainer);
+	const needsPaneFallback = !startTextLayer || !endTextLayer;
+	if (needsPaneFallback) {
+		if ((!startTextLayer && range.startContainer.nodeType !== 1) ||
+			(!endTextLayer && range.endContainer.nodeType !== 1)) return null;
+	} else {
+		if (startPageIndex === null || endPageIndex === null || startPageIndex > endPageIndex ||
+			pdfView.findPageIndexForNode(startTextLayer) !== startPageIndex ||
+			pdfView.findPageIndexForNode(endTextLayer) !== endPageIndex) return null;
+		if (startPageIndex === endPageIndex && startTextLayer !== endTextLayer) return null;
+	}
+
+	const buildSegments = (verifyRenderedPages = false): SelectionPageSegment[] | null => {
+		const segments: SelectionPageSegment[] = [];
+		for (const [pageIndex, group] of Array.from(groups).sort(([left], [right]) => left - right)) {
+			if (verifyRenderedPages && !pdfView.getPageElement(pageIndex)) return null;
+			const origin = group.textLayer.getBoundingClientRect();
+			const rects = dropDegenerateRects(group.rects.map((rect) => clientRectToPageLocal(rect, { x: origin.left, y: origin.top })));
+			const text = group.text.join('');
+			if (rects.length === 0 || !normalizeQuote(text)) return null;
+			segments.push({ pageIndex, textLayer: group.textLayer, pageLocalRects: rects, viewport: group.viewport, text });
+		}
+		for (let index = 1; index < segments.length; index++) {
+			if (segments[index]!.pageIndex !== segments[index - 1]!.pageIndex + 1) return null;
+		}
+		if (normalizeQuote(segments.map((segment) => segment.text).join('')) !== normalizeQuote(range.toString())) return null;
+		return segments.length > 0 ? segments : null;
+	};
+
+	if (needsPaneFallback) {
+		// Preserve valid parent-boundary ranges inside this PDF pane, including
+		// boundaries on the page-list container that have no page index of their own.
+		const pageElements = new Map<number, HTMLElement | null>();
+		const pageViewports = new Map<number, PdfViewportLike>();
+		const paneWalker = doc.createTreeWalker(pdfView.containerEl, showText);
+		let current = paneWalker.nextNode();
+		while (current) {
+			const textNode = current as Text;
+			let intersects = false;
+			try { intersects = range.intersectsNode(textNode); } catch { /* Ignore a detached text node. */ }
+			if (intersects && textNode.data.length > 0) {
+				const pageIndex = pdfView.findPageIndexForNode(textNode);
+				if (pageIndex !== null) {
+					let pageElement = pageElements.get(pageIndex);
+					if (pageElement === undefined) {
+						pageElement = pdfView.getPageElement(pageIndex);
+						pageElements.set(pageIndex, pageElement);
+					}
+					const textLayer = containingTextLayer(textNode);
+					// Keep annotation popups and other page UI out of quotations.
+					if (pageElement?.contains(textLayer) && textLayer?.contains(textNode)) {
+						let viewport = pageViewports.get(pageIndex);
+						if (!viewport) {
+							try { viewport = pdfView.getPageViewport(pageIndex); } catch { return null; }
+							pageViewports.set(pageIndex, viewport);
+						}
+						if (typeof viewport.convertToPdfPoint !== 'function') return null;
+						try {
+							const nodeRange = doc.createRange();
+							nodeRange.selectNodeContents(textNode);
+							const startOffset = range.compareBoundaryPoints(startToStart, nodeRange) <= 0
+								? 0
+								: range.startContainer === textNode ? range.startOffset : 0;
+							const endOffset = range.compareBoundaryPoints(endToEnd, nodeRange) >= 0
+								? textNode.data.length
+								: range.endContainer === textNode ? range.endOffset : textNode.data.length;
+							if (endOffset > startOffset) {
+								nodeRange.setStart(textNode, startOffset);
+								nodeRange.setEnd(textNode, endOffset);
+								const group = groups.get(pageIndex) ?? { text: [], rects: [], viewport, textLayer };
+								if (group.textLayer !== textLayer) return null;
+								group.text.push(textNode.data.slice(startOffset, endOffset));
+								group.rects.push(...Array.from(nodeRange.getClientRects()));
+								groups.set(pageIndex, group);
+							}
+						} catch { return null; }
+					}
+				}
 			}
-			let pageElement = pageElements.get(pageIndex);
-			if (pageElement === undefined) {
-				pageElement = pdfView.getPageElement(pageIndex);
-				pageElements.set(pageIndex, pageElement);
-			}
-			const textLayer = textNode.parentElement?.closest<HTMLElement>('.textLayer') ?? null;
+			current = paneWalker.nextNode();
+		}
+		return buildSegments(true);
+	}
+
+	if (!startTextLayer || !endTextLayer || startPageIndex === null || endPageIndex === null || startPageIndex > endPageIndex) return null;
+
+	for (let pageIndex = startPageIndex; pageIndex <= endPageIndex; pageIndex++) {
+		const pageElement = pdfView.getPageElement(pageIndex);
+		const textLayer = pageElement?.matches('.textLayer') ? pageElement : pageElement?.querySelector<HTMLElement>('.textLayer') ?? null;
+		if (!pageElement || !textLayer || (pageIndex === startPageIndex && !pageElement.contains(startTextLayer)) ||
+			(pageIndex === endPageIndex && !pageElement.contains(endTextLayer))) return null;
+		let viewport: PdfViewportLike;
+		try { viewport = pdfView.getPageViewport(pageIndex); } catch { return null; }
+		if (typeof viewport.convertToPdfPoint !== 'function') return null;
+
+		const collectTextNode = (textNode: Text): boolean => {
+			let intersects = false;
+			try { intersects = range.intersectsNode(textNode); } catch { /* Ignore a detached text node. */ }
+			if (!intersects || textNode.data.length === 0) return true;
+			const nodeTextLayer = containingTextLayer(textNode);
 			// Only PDF.js's selectable text layer belongs in a quotation; annotation
 			// popups and other page UI can also contain text nodes.
-			if (!pageElement?.contains(textLayer) || !textLayer?.contains(textNode)) {
-				current = walker.nextNode();
-				continue;
-			}
-			let viewport = pageViewports.get(pageIndex);
-			if (!viewport) {
-				try { viewport = pdfView.getPageViewport(pageIndex); } catch { return null; }
-				pageViewports.set(pageIndex, viewport);
-			}
-			if (typeof viewport.convertToPdfPoint !== 'function') return null;
+			if (pdfView.findPageIndexForNode(textNode) !== pageIndex || nodeTextLayer !== textLayer || !textLayer.contains(textNode)) return true;
 			try {
 				const nodeRange = doc.createRange();
 				nodeRange.selectNodeContents(textNode);
@@ -260,33 +375,41 @@ function selectionSegmentsForRange(pdfView: ActivePdfView, range: Range): Select
 				if (endOffset > startOffset) {
 					nodeRange.setStart(textNode, startOffset);
 					nodeRange.setEnd(textNode, endOffset);
-					const selectedText = textNode.data.slice(startOffset, endOffset);
 					const group = groups.get(pageIndex) ?? { text: [], rects: [], viewport, textLayer };
-					if (group.textLayer !== textLayer) return null;
-					group.text.push(selectedText);
+					if (group.textLayer !== textLayer) return false;
+					group.text.push(textNode.data.slice(startOffset, endOffset));
 					group.rects.push(...Array.from(nodeRange.getClientRects()));
 					groups.set(pageIndex, group);
 				}
-			} catch { return null; }
+			} catch { return false; }
+			return true;
+		};
+
+		// Range traversal excludes its root node. Handle a same-node selection
+		// directly. For ordinary text endpoints, seed the first page at the start
+		// Text and stop the last page at the end Text; only middle pages need a full
+		// text-layer walk. Element-boundary selections keep the broader fallback.
+		if (range.startContainer === range.endContainer && range.startContainer.nodeType === 3) {
+			if (!collectTextNode(range.startContainer as Text)) return null;
+			continue;
 		}
-		current = walker.nextNode();
+		const walker = doc.createTreeWalker(textLayer, showText);
+		const hasTextEndpoints = range.startContainer.nodeType === 3 && range.endContainer.nodeType === 3;
+		const startTextNode = hasTextEndpoints && pageIndex === startPageIndex ? range.startContainer as Text : null;
+		const endTextNode = hasTextEndpoints && pageIndex === endPageIndex ? range.endContainer as Text : null;
+		if (startTextNode) {
+			walker.currentNode = startTextNode;
+			if (!collectTextNode(startTextNode)) return null;
+		}
+		let current = walker.nextNode();
+		while (current) {
+			if (!collectTextNode(current as Text)) return null;
+			if (current === endTextNode) break;
+			current = walker.nextNode();
+		}
 	}
 
-	const segments: SelectionPageSegment[] = [];
-	for (const [pageIndex, group] of Array.from(groups).sort(([left], [right]) => left - right)) {
-		const pageElement = pdfView.getPageElement(pageIndex);
-		if (!pageElement) return null;
-		const origin = group.textLayer.getBoundingClientRect();
-		const rects = dropDegenerateRects(group.rects.map((rect) => clientRectToPageLocal(rect, { x: origin.left, y: origin.top })));
-		const text = group.text.join('');
-		if (rects.length === 0 || !normalizeQuote(text)) return null;
-		segments.push({ pageIndex, textLayer: group.textLayer, pageLocalRects: rects, viewport: group.viewport, text });
-	}
-	for (let index = 1; index < segments.length; index++) {
-		if (segments[index]!.pageIndex !== segments[index - 1]!.pageIndex + 1) return null;
-	}
-	if (normalizeQuote(segments.map((segment) => segment.text).join('')) !== normalizeQuote(range.toString())) return null;
-	return segments.length > 0 ? segments : null;
+	return buildSegments();
 }
 
 export default class PdfHighlighterPlugin extends Plugin {
@@ -303,35 +426,45 @@ export default class PdfHighlighterPlugin extends Plugin {
 	/** Tracks whichever of our popups is currently open, so they can be dismissed
 	 * or repositioned together and so we never show two at once. */
 	private activePopup: IconPopup | null = null;
+	private pomodoro: PomodoroTimer | null = null;
+	private readonly pomodoroChime = new PomodoroChime();
+	/** Exact annotation belonging to the currently open, unambiguous chooser. */
+	private selectedAnnotation: {
+		capture: CapturedPdfTarget<TFile, ActivePdfView>;
+		target: HighlightTarget;
+		popup: IconPopup;
+		copy: (() => void) | null;
+		clearOutline(): void;
+	} | null = null;
 	private menuGeneration = 0;
-	private readonly toolbarButtons = new Map<HTMLElement, () => void>();
 	private readonly annotationToolbars = new Map<HTMLElement, AnnotationToolbarState>();
 	private readonly pdfReadingLayouts = new Map<HTMLElement, {
 		file: TFile;
 		controller: PdfReadingLayoutController;
 	}>();
 	private readonly pdfFocusModes = new Map<Document, PdfFocusModeState>();
+	private readonly noteMarkerViews = new Map<HTMLElement, {
+		file: TFile;
+		watcher?: PdfNoteLayerWatcher;
+		layers: Set<HTMLElement>;
+	}>();
+	private noteMarkerRetryTimer = 0;
+	private toolbarRetryTimer = 0;
+	private noteMarkerPositions: NoteMarkerPositions | null = null;
+	private readonly pdfLinkReturns = new Map<HTMLElement, { file: TFile; controller: PdfLinkReturnController }>();
 	private readonly annotationHistory = new PdfAnnotationHistory<TFile>();
 	private readonly pendingPreviews = new Set<{ dispose(): void }>();
 	private readonly activeHighlightActions = new Set<AbortController>();
 	private isUnloading = false;
 
-	/** Shared debounce for both the mouseup/pointerup-triggered check and the
-	 * selectionchange-triggered one (see the 'selectionchange' listener in
-	 * onload), so a normal desktop drag-then-release coalesces into the single
-	 * immediate mouseup call instead of an extra rebuild ~100ms later. Later
-	 * callers generally win, except that a 'full' can't be downgraded -- see
-	 * scheduleSelectionUpdate. */
+	/** Coalesces duplicate press/release checks so a normal desktop drag commits
+	 * once instead of scheduling a second pass after the mouseup. */
 	private selectionUpdateTimer = 0;
 	private mouseSelectionDown = false;
 	private lastNonMousePointerAt = -Infinity;
 	private selectionGestureGeneration = 0;
-	private selectionAtPress: { anchorNode: Node | null; anchorOffset: number; focusNode: Node | null; focusOffset: number; text: string } | null = null;
+	private selectionAtPress: SelectionSnapshot | null = null;
 	private readonly interactionDocuments = new Set<Document>();
-
-	/** Which check that timer is currently armed for, so a late low-priority one
-	 * can be refused rather than silently replacing it. */
-	private pendingUpdateMode: SelectionUpdateMode | null = null;
 
 	/** Non-null only on iOS, where WKWebView ignores every ::selection property
 	 * in the PDF text layer and paints a barely-visible system tint instead, so
@@ -339,6 +472,8 @@ export default class PdfHighlighterPlugin extends Plugin {
 	 * Everywhere else ::selection works and this stays null -- painting both
 	 * would double-tint the selection. */
 	private selectionOverlay: SelectionOverlay | null = null;
+	private selectionOverlayDocument: Document | null = null;
+	private selectionOverlayFrame: { id: number; ownerWindow: Window } | null = null;
 
 	/** Where and when the current touch/pen press started, so pointerup can be
 	 * classified and pointercancel can invalidate its captured PDF target. */
@@ -396,10 +531,28 @@ export default class PdfHighlighterPlugin extends Plugin {
 			read: (path) => this.app.vault.adapter.read(path),
 		});
 		if (pluginConflict) {
-			new Notice(`Study PDF Local: ${pluginConflict}`, 0);
+			new Notice(`Rudi's Study PDF: ${pluginConflict}`, 0);
 			return;
 		}
+		configurePdfWorkScheduling(Platform.isIosApp);
 		await this.loadSettings();
+		this.noteMarkerPositions = new NoteMarkerPositions(this.app.vault.adapter,
+			`${this.manifest.dir ?? `${this.app.vault.configDir}/plugins/${this.manifest.id}`}/note-marker-positions.json`,
+			() => new Notice('Comment icon positions could not be saved or loaded. Your PDF notes are unchanged.'),
+		);
+		await this.noteMarkerPositions.load();
+		this.pomodoro = new PomodoroTimer(window, this.app.vault.adapter,
+			`${this.manifest.dir ?? `${this.app.vault.configDir}/plugins/${this.manifest.id}`}/pomodoro.json`,
+			(phase, caughtUp) => {
+				const state = this.pomodoro?.snapshot();
+				if (state) this.pomodoroChime.play(state.volume, state.muted);
+				new Notice(caughtUp ? (state?.running ? `Study timer caught up. ${phase === 'study' ? 'Study' : 'Break'} is running.` : 'Study session and break finished.')
+					: phase === 'break' ? 'Study session complete. Time for a break.'
+					: state?.running ? 'Break finished. Your next study round has started.' : 'Break finished. Ready for your next study round.');
+			},
+			() => new Notice('Study timer settings could not be saved or loaded.'),
+		);
+		await this.pomodoro.load();
 		this.addSettingTab(new PdfHighlighterSettingTab(this.app, this, this));
 		this.registerEvent(this.app.vault.on('modify', (file) => {
 			if (file.path.toLowerCase().endsWith('.pdf')) this.invalidateHighlightIndex();
@@ -433,6 +586,13 @@ export default class PdfHighlighterPlugin extends Plugin {
 		// New PDF tabs need this re-run, hence the same layout-change hook.
 		this.app.workspace.onLayoutReady(() => this.ensureToolbarButtons());
 		this.registerEvent(this.app.workspace.on('layout-change', () => this.ensureToolbarButtons()));
+		this.registerEvent(this.app.workspace.on('file-open', (file) => {
+			if (file?.extension.toLowerCase() === 'pdf') this.ensureToolbarButtons(0, true);
+		}));
+		// Keep marker discovery off ensureToolbarButtons' selection hot path.
+		this.app.workspace.onLayoutReady(() => this.syncPdfNoteMarkers());
+		this.registerEvent(this.app.workspace.on('layout-change', () => this.syncPdfNoteMarkers()));
+		this.registerEvent(this.app.workspace.on('file-open', () => this.syncPdfNoteMarkers()));
 		this.registerEvent(this.app.workspace.on('active-leaf-change', (leaf) => {
 			const activeLeafEl = leaf?.view.containerEl.closest<HTMLElement>('.workspace-leaf') ?? null;
 			for (const [ownerDocument, state] of this.pdfFocusModes) {
@@ -540,25 +700,29 @@ export default class PdfHighlighterPlugin extends Plugin {
 		binding.registerDomEvent(ownerWindow, 'unload', () => {
 			this.exitPdfFocusMode(ownerDocument, false);
 			this.disposePdfReadingLayoutsFor(ownerDocument);
+			for (const container of this.noteMarkerViews.keys()) {
+				if (container.ownerDocument === ownerDocument) this.disposeNoteMarkersForView(container);
+			}
+			for (const [container, state] of this.pdfLinkReturns) {
+				if (container.ownerDocument !== ownerDocument) continue;
+				state.controller.dispose();
+				this.pdfLinkReturns.delete(container);
+			}
 			if (this.pencilGesture?.pdfView.containerEl.ownerDocument === ownerDocument) this.cancelPencilGesture(true);
 			if (this.pendingStylusTouch?.ownerDocument === ownerDocument) this.pendingStylusTouch = null;
 			this.activeTouchContacts.delete(ownerDocument);
 			this.selectionGestureGeneration++;
 			window.clearTimeout(this.selectionUpdateTimer);
-			this.pendingUpdateMode = null;
 			this.mouseSelectionDown = false;
 			if (this.lastPdfClick?.capture.pdfView.containerEl.ownerDocument === ownerDocument) this.lastPdfClick = null;
 			if (this.selectionAtPress?.anchorNode?.ownerDocument === ownerDocument || this.selectionAtPress?.focusNode?.ownerDocument === ownerDocument) this.selectionAtPress = null;
 			if (this.activePopup?.el.ownerDocument === ownerDocument) this.hideActiveMenu();
 			for (const [right, state] of this.annotationToolbars) {
 				if (right.ownerDocument !== ownerDocument) continue;
+				this.clearAnnotationToolbarAppearance(state);
+				state.regionSelection?.dispose();
 				state.toolbar.destroy();
 				this.annotationToolbars.delete(right);
-			}
-			for (const [button, remove] of this.toolbarButtons) {
-				if (button.ownerDocument !== ownerDocument) continue;
-				remove();
-				this.toolbarButtons.delete(button);
 			}
 			this.removeChild(binding);
 		});
@@ -567,7 +731,6 @@ export default class PdfHighlighterPlugin extends Plugin {
 			if (!this.isInsideActivePopup(evt.target) && evt.button === 0) {
 				this.mouseSelectionDown = true;
 				window.clearTimeout(this.selectionUpdateTimer);
-				this.pendingUpdateMode = null;
 				this.hideActiveMenu();
 			}
 			// A mouse press means we are not mid-touch; drop any remembered touch
@@ -584,7 +747,12 @@ export default class PdfHighlighterPlugin extends Plugin {
 			if (this.isInsideActivePopup(evt.target)) return;
 			// A selection isn't final the instant mouseup fires in every browser;
 			// yielding a tick first avoids reading a stale/incomplete selection.
-			this.scheduleSelectionUpdate(0, 'full', this.lastPdfClick?.capture ?? null);
+			const click = this.lastPdfClick;
+			const editNote = evt.detail === 2 && !evt.defaultPrevented && !evt.altKey && !evt.ctrlKey && !evt.metaKey && !evt.shiftKey &&
+				click !== null && Math.hypot(evt.clientX - click.clientX, evt.clientY - click.clientY) <= 4 &&
+				isDomNode(evt.target) && click.capture.pdfView.containerEl.contains(evt.target) &&
+				!eventElements(evt).some((element) => element.matches('a, button') || isEditableElement(element));
+			this.scheduleSelectionUpdate(0, click?.capture ?? null, editNote);
 		});
 
 		binding.registerDomEvent(ownerWindow, 'blur', () => {
@@ -597,10 +765,12 @@ export default class PdfHighlighterPlugin extends Plugin {
 			this.selectionGestureGeneration++;
 			this.mouseSelectionDown = false;
 			window.clearTimeout(this.selectionUpdateTimer);
-			this.pendingUpdateMode = null;
-			this.hideActiveMenu();
+			if (!this.activePopup?.preserveOnBlur) this.hideActiveMenu();
 		});
-		binding.registerDomEvent(ownerDocument, 'keydown', (evt) => this.handlePdfKeyboardShortcut(ownerDocument, evt), true);
+		binding.registerDomEvent(ownerDocument, 'keydown', (evt) => {
+			this.handlePdfKeyboardShortcut(ownerDocument, evt);
+		}, true);
+		binding.registerDomEvent(ownerDocument, 'contextmenu', (evt) => this.openPageNoteAtClick(ownerDocument, evt), true);
 
 		// Touch taps reach the two listeners above only as *compatibility* mouse
 		// events, which the engine synthesizes after touchend and suppresses
@@ -622,6 +792,8 @@ export default class PdfHighlighterPlugin extends Plugin {
 			this.lastNonMousePointerAt = performance.now();
 			this.activePointers.add(evt.pointerId);
 			if (this.activePointers.size > 1 || this.pencilGesture || (Platform.isIosApp && this.pendingStylusTouch)) {
+				this.selectionGestureGeneration++;
+				this.selectionAtPress = null;
 				this.cancelPencilGesture(true);
 				this.pendingStylusTouch = null;
 				this.isMultiTouchGesture = true;
@@ -643,6 +815,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 			if (evt.pointerType !== 'pen' || Platform.isIosApp) return;
 			const gesture = this.pencilGesture;
 			if (!gesture || gesture.input.kind !== 'pointer' || gesture.input.id !== evt.pointerId) return;
+			gesture.selection.moved ||= hasPencilDragDistance(gesture.selection, evt.clientX, evt.clientY);
 			evt.preventDefault();
 			this.queuePencilGestureUpdate(gesture, evt.clientX, evt.clientY);
 		});
@@ -660,6 +833,17 @@ export default class PdfHighlighterPlugin extends Plugin {
 			}
 			const press = this.pendingPress;
 			const selectionCapture = this.lastPdfClick?.capture ?? null;
+			const selection = !press && Platform.isIosApp ? ownerDocument.defaultView?.getSelection() : null;
+			const baseline = this.selectionAtPress;
+			const selectionPdfView = this.lastPdfClick?.capture.pdfView;
+			const nativeHandleSelectionChanged = Boolean(
+				selection && !selection.isCollapsed && selection.anchorNode && selection.focusNode && baseline &&
+				baseline.anchorNode?.ownerDocument === ownerDocument && baseline.focusNode?.ownerDocument === ownerDocument &&
+				selectionPdfView?.containerEl.ownerDocument === ownerDocument &&
+				selectionPdfView.containerEl.contains(selection.anchorNode) && selectionPdfView.containerEl.contains(selection.focusNode) &&
+				(baseline.anchorNode !== selection.anchorNode || baseline.anchorOffset !== selection.anchorOffset ||
+					baseline.focusNode !== selection.focusNode || baseline.focusOffset !== selection.focusOffset),
+			);
 			this.pendingPress = null;
 			if (this.releasePointer(evt.pointerId)) {
 				this.cancelPencilGesture(true);
@@ -683,7 +867,16 @@ export default class PdfHighlighterPlugin extends Plugin {
 			})) {
 				this.lastPdfClick = null;
 				this.lastTouchPressPoint = null;
-				this.scheduleSelectionUpdate(0, 'full', selectionCapture);
+				this.scheduleSelectionUpdate(0, selectionCapture);
+				return;
+			}
+			if (nativeHandleSelectionChanged) {
+				// WKWebView can swallow pointerdown while the native selection handles
+				// move. Keep that release from being mistaken for a tap away from the
+				// selection. Commit only at this actual release, using its original
+				// capture/baseline and the usual tool/current-view validation.
+				this.lastTouchPressPoint = null;
+				this.scheduleSelectionUpdate(0, selectionCapture);
 				return;
 			}
 			// ??=, not =: keep the pointerdown point when one arrived.
@@ -693,7 +886,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 			if (!press) this.recordPdfPress(evt);
 			// Reaching here means this pointerup passed the tap threshold (or came
 			// from an iOS path that swallowed pointerdown).
-			this.scheduleSelectionUpdate(0, 'full', this.lastPdfClick?.capture ?? null);
+			this.scheduleSelectionUpdate(0, this.lastPdfClick?.capture ?? selectionCapture);
 		});
 
 		// iOS also cancels brief thumb taps. Keep only a short, low-travel sequence;
@@ -744,7 +937,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 				return;
 			}
 			this.lastTouchPressPoint ??= { x: evt.clientX, y: evt.clientY };
-			this.scheduleSelectionUpdate(0, 'full');
+			this.scheduleSelectionUpdate(0);
 		});
 		if (Platform.isIosApp) {
 			binding.registerDomEvent(ownerDocument, 'touchstart', (evt) => this.handleStylusTouchStart(ownerDocument, evt), { passive: false });
@@ -764,13 +957,11 @@ export default class PdfHighlighterPlugin extends Plugin {
 			() => {
 				// The overlay is positioned in viewport coordinates, so it has to
 				// follow the page even when the popup is being left alone.
-				this.refreshSelectionOverlay();
+				this.scheduleSelectionOverlayRefresh(ownerDocument);
 				if (this.activePopup?.preserveOnScroll) {
-					this.activePopup.reposition();
 					return;
 				}
 				if (this.isInsideActivePopup(ownerDocument.activeElement)) {
-					this.activePopup?.reposition();
 					return;
 				}
 				this.hideActiveMenu();
@@ -778,38 +969,46 @@ export default class PdfHighlighterPlugin extends Plugin {
 			true,
 		);
 
-		// A touch text selection is made by long-pressing then dragging the
-		// native selection handles -- on touchscreens that handle drag is a
-		// native OS/WebView gesture that never dispatches a page-level mouseup,
-		// so the mouseup listener above alone would only ever show the popup for
-		// whatever got selected on the initial long-press. `selectionchange`
-		// fires for every adjustment regardless of how the selection changed
-		// (mouse drag included), so debouncing off it keeps the popup in sync
-		// with the selection as it's extended. Not mobile-only: this also runs
-		// (and gets exercised) during an ordinary desktop mouse-drag.
+		// Native selection handles do not dispatch page-level pointermove events.
+		// selectionchange keeps the iOS overlay painted during those adjustments;
+		// the menu check runs once the completed selection is released.
 		if (Platform.isIosApp) {
-			this.selectionOverlay = createSelectionOverlay(ownerDocument);
+			this.cancelSelectionOverlayRefresh();
+			this.selectionOverlay?.destroy();
+			const overlay = createSelectionOverlay(ownerDocument);
+			this.selectionOverlay = overlay;
+			this.selectionOverlayDocument = ownerDocument;
 			binding.register(() => {
-				this.selectionOverlay?.destroy();
+				if (this.selectionOverlay !== overlay) return;
+				this.cancelSelectionOverlayRefresh();
+				overlay.destroy();
 				this.selectionOverlay = null;
+				this.selectionOverlayDocument = null;
 			});
 		}
 
 		binding.registerDomEvent(ownerDocument, 'selectionchange', () => {
 			// Pencil-owned selection changes are painted once by its rAF batch.
-			// Let other native selections repaint immediately as before.
-			if (!this.pencilGesture) this.refreshSelectionOverlay();
-			if (!this.mouseSelectionDown && !this.pencilGesture) this.scheduleSelectionUpdate(100, 'selection-only');
+			// Other native selection and scroll events share one visual frame.
+			if (!this.pencilGesture) this.scheduleSelectionOverlayRefresh(ownerDocument);
 		});
 		binding.register(() => {
 			window.clearTimeout(this.selectionUpdateTimer);
-			this.pendingUpdateMode = null;
 		});
 
 	}
 
 	onunload() {
 		this.isUnloading = true;
+		configurePdfWorkScheduling(false);
+		this.cancelSelectionOverlayRefresh();
+		this.pomodoro?.dispose();
+		this.pomodoroChime.dispose();
+		window.clearTimeout(this.noteMarkerRetryTimer);
+		window.clearTimeout(this.toolbarRetryTimer);
+		for (const container of this.noteMarkerViews.keys()) this.disposeNoteMarkersForView(container);
+		for (const state of this.pdfLinkReturns.values()) state.controller.dispose();
+		this.pdfLinkReturns.clear();
 		this.cancelPencilGesture(true);
 		this.pendingStylusTouch = null;
 		this.activeTouchContacts.clear();
@@ -821,16 +1020,17 @@ export default class PdfHighlighterPlugin extends Plugin {
 		this.annotationHistory.clearAll();
 		this.interactionDocuments.clear();
 		window.clearTimeout(this.selectionUpdateTimer);
-		this.pendingUpdateMode = null;
 		this.lastPdfClick = null;
 		this.invalidateHighlightIndex();
 		this.hideActiveMenu();
 		for (const ownerDocument of [...this.pdfFocusModes.keys()]) this.exitPdfFocusMode(ownerDocument, false);
 		for (const { controller } of this.pdfReadingLayouts.values()) controller.dispose();
 		this.pdfReadingLayouts.clear();
-		for (const removeButton of this.toolbarButtons.values()) removeButton();
-		this.toolbarButtons.clear();
-		for (const { toolbar } of this.annotationToolbars.values()) toolbar.destroy();
+		for (const state of this.annotationToolbars.values()) {
+			this.clearAnnotationToolbarAppearance(state);
+			state.regionSelection?.dispose();
+			state.toolbar.destroy();
+		}
 		this.annotationToolbars.clear();
 		for (const preview of this.pendingPreviews) {
 			try { preview.dispose(); } catch { /* Continue releasing the remaining views. */ }
@@ -858,7 +1058,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 		);
 		if (!persisted) {
 			new Notice(
-				'Study PDF Local repaired its settings for this session but could not save the repair. Choose the default color again in settings to retry.',
+				'Rudi\'s Study PDF repaired its settings for this session but could not save the repair. Choose the default color again in settings to retry.',
 			);
 		}
 	}
@@ -871,55 +1071,41 @@ export default class PdfHighlighterPlugin extends Plugin {
 		return normalized;
 	}
 
-	/** Toolbars persist across PDF switches. Resolve their current file on click
-	 * and replace any orphaned button from an older plugin instance. */
-	private ensureToolbarButtons() {
+	/** Install one toolbar per live PDF view. Callbacks resolve the current view
+	 * at click time so a reused pane always acts on its open file. */
+	private ensureToolbarButtons(attempt = 0, retryIfEmpty = false) {
 		if (this.isUnloading) return;
-		for (const [button, removeButton] of this.toolbarButtons) {
-			if (button.isConnected) continue;
-			removeButton();
-			this.toolbarButtons.delete(button);
+		window.clearTimeout(this.toolbarRetryTimer);
+		let views: ActivePdfView[];
+		try { views = getAllPdfViews(this.app); }
+		catch {
+			if (attempt < 3) this.toolbarRetryTimer = window.setTimeout(() => this.ensureToolbarButtons(attempt + 1, retryIfEmpty), 500);
+			return;
 		}
-		const views = getAllPdfViews(this.app);
+		if (views.length === 0 && retryIfEmpty && attempt < 3) {
+			this.toolbarRetryTimer = window.setTimeout(() => this.ensureToolbarButtons(attempt + 1, retryIfEmpty), 500);
+			return;
+		}
 		this.prunePdfFocusModes(views);
 		this.syncPdfReadingLayouts(views);
 		const liveToolbars = new Set(views.map((view) => view.getToolbarRightElement()));
 		for (const [right, state] of this.annotationToolbars) {
 			if (liveToolbars.has(right) && state.toolbar.el.isConnected) continue;
+			this.clearAnnotationToolbarAppearance(state);
+			state.regionSelection?.dispose();
 			state.toolbar.destroy();
 			this.annotationToolbars.delete(right);
 		}
+		let toolbarMissing = false;
 		for (const pdfView of views) {
 			this.bindPdfDocumentInteractions(pdfView.containerEl.ownerDocument);
 			const toolbarRight = pdfView.getToolbarRightElement();
-			if (!toolbarRight) continue;
-			this.ensureAnnotationToolbar(toolbarRight);
-			const existing = toolbarRight.querySelector<HTMLElement>(':scope > .study-pdf-toolbar-button');
-			if (existing && this.toolbarButtons.has(existing)) continue;
-			existing?.remove();
-
-			const button = toolbarRight.createDiv('clickable-icon study-pdf-toolbar-button');
-			setIcon(button, 'list-checks');
-			setTooltip(button, 'Show all highlights and notes');
-			const onClick = () => {
-				if (this.isUnloading) return;
-				const currentView = getAllPdfViews(this.app).find((view) =>
-					view.getToolbarRightElement() === toolbarRight,
-				);
-				if (!currentView) return;
-				new HighlightListModal(
-					this.app,
-					currentView,
-					this.pdfMutationCoordinator,
-					() => this.exportHighlightsToNote(currentView),
-					(entries, snapshotFingerprint) => this.exportSelectedHighlightsToNote(currentView, entries, snapshotFingerprint),
-				).open();
-			};
-			button.addEventListener('click', onClick);
-			this.toolbarButtons.set(button, () => {
-				button.removeEventListener('click', onClick);
-				button.remove();
-			});
+			if (!toolbarRight) { toolbarMissing = true; continue; }
+			this.ensureAnnotationToolbar(pdfView, toolbarRight);
+			toolbarRight.querySelector<HTMLElement>(':scope > .study-pdf-toolbar-button')?.remove();
+		}
+		if (toolbarMissing && attempt < 3) {
+			this.toolbarRetryTimer = window.setTimeout(() => this.ensureToolbarButtons(attempt + 1, retryIfEmpty), 500);
 		}
 	}
 
@@ -942,6 +1128,161 @@ export default class PdfHighlighterPlugin extends Plugin {
 				controller: createPdfReadingLayout(view),
 			});
 		}
+	}
+
+	private disposeNoteMarkersForView(container: HTMLElement) {
+		const state = this.noteMarkerViews.get(container);
+		if (!state) return;
+		state.watcher?.dispose();
+		for (const layer of state.layers) disposeNoteMarkers(layer);
+		this.noteMarkerViews.delete(container);
+	}
+
+	private syncPdfNoteMarkers(attempt = 0) {
+		if (this.isUnloading) return;
+		window.clearTimeout(this.noteMarkerRetryTimer);
+		const retryWhenReady = () => {
+			if (attempt >= 3) return;
+			// A bounded readiness retry at file-open only; never selection/scroll polling.
+			this.noteMarkerRetryTimer = window.setTimeout(() => this.syncPdfNoteMarkers(attempt + 1), 500);
+		};
+		let views: ActivePdfView[];
+		try { views = getAllPdfViews(this.app); } catch { retryWhenReady(); return; }
+		const liveViews = new Map(views.map((view) => [view.containerEl, view]));
+		for (const [container, state] of this.pdfLinkReturns) {
+			if (liveViews.get(container)?.file === state.file && state.controller.isCurrent()) continue;
+			state.controller.dispose();
+			this.pdfLinkReturns.delete(container);
+		}
+		for (const view of views) {
+			if (this.pdfLinkReturns.has(view.containerEl)) continue;
+			this.pdfLinkReturns.set(view.containerEl, { file: view.file, controller: createPdfLinkReturn(view) });
+		}
+		for (const [container, state] of this.noteMarkerViews) {
+			if (liveViews.get(container)?.file !== state.file || !state.watcher?.isCurrent()) this.disposeNoteMarkersForView(container);
+		}
+		for (const view of views) {
+			if (this.noteMarkerViews.has(view.containerEl) || !view.watchNoteLayers) continue;
+			const state = { file: view.file, layers: new Set<HTMLElement>(), watcher: undefined as PdfNoteLayerWatcher | undefined };
+			this.noteMarkerViews.set(view.containerEl, state);
+			state.watcher = view.watchNoteLayers((page) => {
+				if (this.isUnloading || this.noteMarkerViews.get(view.containerEl) !== state) return;
+				for (const oldLayer of state.layers) {
+					if (oldLayer === page.layer || view.containerEl.contains(oldLayer)) continue;
+					disposeNoteMarkers(oldLayer);
+					state.layers.delete(oldLayer);
+				}
+				state.layers.add(page.layer);
+				updateNoteMarkers(page.layer, (id) => page.readAnnotation(id), (id, position) => {
+					void this.openNoteMarker(view, page.pageIndex, id, position);
+				}, page.viewportHeight, {
+					get: (key) => {
+						const stored = this.noteMarkerPositions?.get(view.file.path, page.pageIndex, key);
+						if (!stored || !page.fromPdfPoint) return undefined;
+						const position = page.fromPdfPoint(stored);
+						if (!Number.isFinite(position.x) || !Number.isFinite(position.y)) return undefined;
+						return { x: Math.max(0, Math.min(1, position.x)), y: Math.max(0, Math.min(1, position.y)) };
+					},
+					save: (key, position) => {
+						if (this.isUnloading || this.noteMarkerViews.get(view.containerEl) !== state) return;
+						if (!page.toPdfPoint) return;
+						this.noteMarkerPositions?.set(view.file.path, page.pageIndex, key, { ...page.toPdfPoint(position), space: 'pdf' });
+						for (const other of this.noteMarkerViews.values()) if (other.file === view.file) other.watcher?.refresh([page.pageIndex]);
+					},
+				}, page.viewportWidth);
+			});
+		}
+		if ([...this.noteMarkerViews.values()].some((state) => !state.watcher?.isCurrent()) ||
+			[...this.pdfLinkReturns.values()].some((state) => !state.controller.isCurrent())) retryWhenReady();
+	}
+
+	private async openNoteMarker(view: ActivePdfView, pageIndex: number, id: string, position: { x: number; y: number }) {
+		if (this.isUnloading) return;
+		const match = /^(\d+)R(\d*)$/.exec(id);
+		if (!match) return;
+		const capture = capturePdfTarget(view.file, view);
+		if (!this.isCapturedPdfCurrent(capture)) return;
+		window.clearTimeout(this.selectionUpdateTimer);
+		this.lastPdfClick = null;
+		this.lastTouchPressPoint = null;
+		this.hideActiveMenu();
+		const generation = this.menuGeneration;
+		try {
+			const index = await this.getHighlightIndexForCapture(capture);
+			if (this.isUnloading || this.menuGeneration !== generation || !this.isCapturedPdfCurrent(capture)) return;
+			const matches = (index.get(pageIndex) ?? []).filter((entry) =>
+				entry.target?.objectNumber === Number(match[1]) && entry.target.generationNumber === Number(match[2] || 0),
+			);
+			const entry = matches.length === 1 ? matches[0] : null;
+			if (!entry?.target) return;
+			this.openAnnotationNote(capture, entry.target, entry.note, position);
+		} catch (error) {
+			if (!this.isUnloading && this.menuGeneration === generation) new Notice(`Study PDF: could not open note -- ${(error as Error).message}`);
+		}
+	}
+
+	private openAnnotationNote(
+		capture: CapturedPdfTarget<TFile, ActivePdfView>,
+		target: HighlightTarget,
+		note: string | null,
+		position: { x: number; y: number },
+	) {
+		if (this.isUnloading || !this.isCapturedPdfCurrent(capture)) return;
+		this.openPdfNoteEditor(capture.pdfView.containerEl.ownerDocument, position, note ?? '',
+			(text) => this.performSetNoteForTarget(capture, target, text));
+	}
+
+	private openPdfNoteEditor(doc: Document, position: { x: number; y: number }, initial: string,
+		onSave: (note: string) => Promise<boolean>, inputLabel?: string) {
+		this.hideActiveMenu();
+		let popup: IconPopup;
+		const close = () => { if (this.activePopup === popup) this.hideActiveMenu(); };
+		popup = showNoteEditorPopup(this.app, doc, { x: position.x, y: position.y }, {
+			initial,
+			onSave,
+			inputLabel,
+			onSaved: close,
+			onCancel: close,
+		});
+		this.activePopup = popup;
+	}
+
+	private openPageNoteAtClick(doc: Document, event: MouseEvent) {
+		if (this.isUnloading || event.defaultPrevented || event.shiftKey ||
+			(event.button !== 2 && !(event.button === 0 && event.ctrlKey)) || this.isInsideActivePopup(event.target) ||
+			this.activePopup?.el.classList.contains('study-pdf-note-editor')) return;
+		if (!isDomNode(event.target) || eventElements(event).some((el) =>
+			el.matches('a, button, .textAnnotation, .study-pdf-region-selector') || isEditableElement(el))) return;
+		let owner: ReturnType<typeof findPdfViewForNode<ActivePdfView>>;
+		try { owner = findPdfViewForNode(getAllPdfViews(this.app), event.target); } catch { return; }
+		if (!owner || owner.view.containerEl.ownerDocument !== doc || this.getOwnedNativeSelection(owner.view)) return;
+		const { view, pageIndex } = owner;
+		const point = this.pdfPointAtPress(view, pageIndex, event.clientX, event.clientY);
+		if (!point) return;
+		const capture = capturePdfTarget(view.file, view);
+		const revision = this.pdfRevisionKey(view.file);
+		event.preventDefault();
+		event.stopPropagation();
+		this.cancelPendingSelectionUpdate();
+		this.lastPdfClick = null;
+		this.openPdfNoteEditor(doc, { x: event.clientX, y: event.clientY }, '', async (note) => {
+			if (!note.trim()) {
+				new Notice('Write a note before saving.');
+				return false;
+			}
+			try {
+				const result = await this.mutateCapturedPdf(capture, [pageIndex], async (bytes) => {
+					if (this.pdfRevisionKey(capture.file) !== revision) {
+						throw new Error('The PDF changed after this location was selected. Copy your draft and reopen the note at the current location.');
+					}
+					return { bytes: await addPageNote(bytes, { pageIndex, point, note }), value: undefined };
+				});
+				return result.changed;
+			} catch (error) {
+				if (!this.isUnloading) new Notice(`Study PDF: could not save page note — ${(error as Error).message}`);
+				return false;
+			}
+		}, 'Page note');
 	}
 
 	private prunePdfFocusModes(views: ActivePdfView[]) {
@@ -1066,15 +1407,6 @@ export default class PdfHighlighterPlugin extends Plugin {
 		});
 	}
 
-	private fitPdfToWidth(pdfView: ActivePdfView) {
-		this.preparePdfForLayoutChange(pdfView);
-		if (!pdfView.fitToWidth()) {
-			new Notice('Fit width is unavailable in this Obsidian PDF viewer.');
-			return;
-		}
-		this.pdfReadingLayouts.get(pdfView.containerEl)?.controller.refresh();
-	}
-
 	private togglePdfFocusMode(pdfView: ActivePdfView, toolbar: AnnotationToolbar) {
 		const ownerDocument = pdfView.containerEl.ownerDocument;
 		const current = this.pdfFocusModes.get(ownerDocument);
@@ -1098,36 +1430,15 @@ export default class PdfHighlighterPlugin extends Plugin {
 			leafEl,
 			toolbar,
 			toolbarObserver: null,
-			showTools: false,
 			returnFocusEl,
 		};
 		leafEl.classList.add('study-pdf-focus');
-		leafEl.classList.remove('study-pdf-focus-tools');
 		ownerDocument.body?.classList.add('study-pdf-focus-active');
 		this.pdfFocusModes.set(ownerDocument, state);
 		this.watchPdfFocusToolbar(ownerDocument, state);
 		this.refreshNativePageWidthAfterLayout(pdfView.containerEl, pdfView.file);
 		this.verifyPdfFocusGeometry(ownerDocument, pdfView.containerEl, pdfView.file);
 		this.refreshAnnotationToolbars();
-	}
-
-	private togglePdfFocusTools(ownerDocument: Document) {
-		const state = this.pdfFocusModes.get(ownerDocument);
-		if (!state) return;
-		const pdfView = getAllPdfViews(this.app).find((view) =>
-			view.containerEl === state.containerEl && view.file === state.file,
-		);
-		if (!pdfView) {
-			this.exitPdfFocusMode(ownerDocument, false);
-			return;
-		}
-		this.preparePdfForLayoutChange(pdfView);
-		state.showTools = !state.showTools;
-		state.leafEl.classList.toggle('study-pdf-focus-tools', state.showTools);
-		this.pdfReadingLayouts.get(state.containerEl)?.controller.refresh();
-		this.refreshNativePageWidthAfterLayout(state.containerEl, state.file);
-		this.refreshAnnotationToolbars();
-		this.verifyPdfFocusGeometry(ownerDocument, state.containerEl, state.file);
 	}
 
 	private exitPdfFocusMode(ownerDocument: Document, restoreFocus: boolean) {
@@ -1144,7 +1455,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 			if (this.pencilGesture?.pdfView.containerEl === state.containerEl) this.cancelPencilGesture(true);
 		}
 		state.toolbarObserver?.disconnect();
-		state.leafEl.classList.remove('study-pdf-focus', 'study-pdf-focus-tools');
+		state.leafEl.classList.remove('study-pdf-focus');
 		if (!Array.from(this.pdfFocusModes.keys()).some((document) => document === ownerDocument)) {
 			ownerDocument.body?.classList.remove('study-pdf-focus-active');
 		}
@@ -1154,7 +1465,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 		if (restoreFocus && state.returnFocusEl?.isConnected) state.returnFocusEl.focus({ preventScroll: true });
 	}
 
-	private ensureAnnotationToolbar(toolbarRight: HTMLElement) {
+	private ensureAnnotationToolbar(knownView: ActivePdfView, toolbarRight: HTMLElement) {
 		const nativeToolbar = toolbarRight.closest<HTMLElement>('.pdf-toolbar') ?? toolbarRight.parentElement;
 		if (!nativeToolbar) return;
 		const currentView = () => this.isUnloading ? undefined : getAllPdfViews(this.app).find(
@@ -1164,13 +1475,55 @@ export default class PdfHighlighterPlugin extends Plugin {
 		if (!state) {
 			// A reload may leave an old instance's row attached to the native toolbar.
 			for (const sibling of [nativeToolbar.previousElementSibling, nativeToolbar.nextElementSibling]) {
-				if (sibling?.classList.contains('study-pdf-annotation-toolbar')) sibling.remove();
+				if (!sibling?.classList.contains('study-pdf-annotation-toolbar')) continue;
+				restoreNativePdfToolbarControls(sibling as HTMLElement);
+				sibling.remove();
 			}
 			let pendingSelection: SelectionContext | null = null;
 			const toolbar = createAnnotationToolbar(nativeToolbar, {
-				onPress: () => {
+				pageKeymap: this.app.keymap,
+				watchPagePosition: (onChange) => currentView()?.watchPagePosition?.(onChange) ?? (() => {}),
+				getPagePosition: () => {
 					const view = currentView();
-					pendingSelection = view ? this.trySelectionContext(view) : null;
+					return view ? { page: view.getCurrentPageNumber(), total: view.getPageCount() } : null;
+				},
+				goToPage: (page) => {
+					const view = currentView();
+					if (!view || !Number.isInteger(page) || page < 1 || page > view.getPageCount()) return false;
+					view.goToPage(page);
+					return true;
+				},
+				onPagePopupOpen: (popup) => {
+					this.cancelPendingSelectionUpdate();
+					this.hideActiveMenu();
+					this.activePopup = popup;
+				},
+				onPagePopupClose: (popup) => {
+					if (this.activePopup === popup) { this.activePopup = null; this.menuGeneration++; }
+				},
+				pomodoro: this.pomodoro ?? undefined,
+				onPomodoro: (anchor) => {
+					if (!this.pomodoro) return null;
+					this.cancelPendingSelectionUpdate();
+					this.hideActiveMenu();
+					let popup: IconPopup;
+					popup = showPomodoroPopup(this.app, anchor.ownerDocument, anchor, this.pomodoro, this.pomodoroChime, () => {
+						if (this.activePopup === popup) { this.activePopup = null; this.menuGeneration++; }
+					});
+					this.activePopup = popup;
+					return popup;
+				},
+				onPress: (event) => {
+					const target = event.target as Element | null;
+					if (target && typeof target.closest === 'function' && target.closest('.pdf-page-input')) {
+						pendingSelection = null;
+						return;
+					}
+					const view = currentView();
+					const colorButton = target && typeof target.closest === 'function'
+						? target.closest('.study-pdf-annotation-color')
+						: null;
+					pendingSelection = view && colorButton ? this.trySelectionContext(view) : null;
 				},
 				onCancel: () => { pendingSelection = null; },
 				onMode: (highlighting) => {
@@ -1179,6 +1532,46 @@ export default class PdfHighlighterPlugin extends Plugin {
 					if (!view || !live) return;
 					pendingSelection = null;
 					this.setAnnotationMode(view, live, highlighting);
+				},
+				onArea: () => {
+					pendingSelection = null;
+					const view = currentView();
+					const live = this.annotationToolbars.get(toolbarRight);
+					if (!view || !live) return;
+					if (live.regionSelection) { this.setAnnotationMode(view, live, false); return; }
+					this.setAnnotationMode(view, live, false);
+					const capture = capturePdfTarget(view.file, view);
+					view.containerEl.ownerDocument.defaultView?.getSelection()?.removeAllRanges();
+					try {
+						live.regionSelection = createRegionSelection(view, {
+							isCurrent: () => !this.isUnloading && this.isCapturedPdfCurrent(capture),
+							colors: () => this.settings.colors,
+							onHighlight: (region, color) => this.highlightRegion(view, region, color.hex),
+							onInteractionStart: () => {
+								this.cancelPendingSelectionUpdate();
+								this.lastPdfClick = null;
+								this.lastTouchPressPoint = null;
+								this.hideActiveMenu();
+							},
+							onTapAnnotation: (tap, isCurrent) => {
+								const press = capturePdfPress(capture, { pageIndex: tap.pageIndex,
+									clientX: tap.position.x, clientY: tap.position.y, pdfPoint: tap.pdfPoint });
+								void this.showCandidatesForClick(press, false, { isCurrent, regionsOnly: true });
+							},
+							hasOpenPopup: () => this.activePopup?.el.ownerDocument === view.containerEl.ownerDocument,
+							canHandleEscape: (event) => {
+								const ownerDocument = view.containerEl.ownerDocument;
+								const focusedView = this.getFocusedPdfViewForKeyEvent(ownerDocument, event);
+								if (!focusedView || focusedView.containerEl !== view.containerEl || focusedView.file !== capture.file) return false;
+								const elements = eventElements(event);
+								const activeElement = ownerDocument.activeElement;
+								return !elements.some(isEditableElement) && !isEditableElement(activeElement) &&
+									!hasIgnoredShortcutContext(ownerDocument, elements, activeElement);
+							},
+							onExit: () => this.setAnnotationMode(view, live, false),
+						});
+						this.updateAnnotationToolbar(live);
+					} catch (error) { new Notice((error as Error).message); }
 				},
 				onColor: (colorId, event) => {
 					const view = currentView();
@@ -1195,30 +1588,76 @@ export default class PdfHighlighterPlugin extends Plugin {
 					const view = currentView();
 					if (view) void this.applyPdfHistory(view, 'redo');
 				},
-				onFitWidth: () => {
+				onShowHighlights: () => {
 					pendingSelection = null;
 					const view = currentView();
-					if (view) this.fitPdfToWidth(view);
+					if (!view) return;
+					new HighlightListModal(
+						this.app,
+						view,
+						this.pdfMutationCoordinator,
+						() => this.exportHighlightsToNote(view),
+						(entries, snapshotFingerprint) => this.exportSelectedHighlightsToNote(view, entries, snapshotFingerprint),
+					).open();
 				},
 				onFocus: () => {
 					pendingSelection = null;
 					const view = currentView();
 					if (view) this.togglePdfFocusMode(view, toolbar);
 				},
-				onToggleTools: () => {
-					pendingSelection = null;
+				onAppearance: (anchor) => {
 					const view = currentView();
-					const focus = this.pdfFocusModes.get(toolbarRight.ownerDocument);
-					if (view && focus?.containerEl === view.containerEl && focus.file === view.file) {
-						this.togglePdfFocusTools(toolbarRight.ownerDocument);
-					}
+					const live = this.annotationToolbars.get(toolbarRight);
+					if (!view || !live) return null;
+					this.hideActiveMenu();
+					let popup: IconPopup;
+					popup = showReadingAppearancePopup(view.containerEl.ownerDocument, anchor, live.appearance, (appearance) => {
+						const current = currentView();
+						const currentState = this.annotationToolbars.get(toolbarRight);
+						if (!current || current.containerEl !== view.containerEl || currentState !== live) return;
+						currentState.appearance = appearance;
+						this.setAnnotationToolbarAppearance(currentState, current.containerEl);
+						this.updateAnnotationToolbar(currentState);
+					}, () => {
+						if (this.activePopup === popup) { this.activePopup = null; this.menuGeneration++; }
+					});
+					this.activePopup = popup;
+					return popup;
 				},
 			});
-			state = { toolbar, colorId: getDefaultColor(this.settings).id, highlighting: false, file: null };
+			state = {
+				toolbar,
+				regionSelection: null,
+				colorId: getDefaultColor(this.settings).id,
+				highlighting: false,
+				appearance: 'original',
+				appearanceContainer: null,
+				file: null,
+			};
 			this.annotationToolbars.set(toolbarRight, state);
 		}
-		state.file = currentView()?.file ?? null;
+		const view = knownView;
+		if (state.regionSelection && (state.file !== view?.file || !view?.containerEl.getClientRects().length)) {
+			state.regionSelection.dispose();
+			state.regionSelection = null;
+		}
+		state.file = view?.file ?? null;
+		if (view) this.setAnnotationToolbarAppearance(state, view.containerEl);
+		else this.clearAnnotationToolbarAppearance(state);
 		this.updateAnnotationToolbar(state);
+	}
+
+	private setAnnotationToolbarAppearance(state: AnnotationToolbarState, containerEl: HTMLElement) {
+		if (state.appearanceContainer && state.appearanceContainer !== containerEl) {
+			clearPdfReadingAppearance(state.appearanceContainer);
+		}
+		state.appearanceContainer = containerEl;
+		setPdfReadingAppearance(containerEl, state.appearance);
+	}
+
+	private clearAnnotationToolbarAppearance(state: AnnotationToolbarState) {
+		if (state.appearanceContainer) clearPdfReadingAppearance(state.appearanceContainer);
+		state.appearanceContainer = null;
 	}
 
 	private updateAnnotationToolbar(state: AnnotationToolbarState) {
@@ -1233,7 +1672,8 @@ export default class PdfHighlighterPlugin extends Plugin {
 			state.highlighting,
 			history,
 			Boolean(focus),
-			focus?.showTools ?? false,
+			state.appearance,
+			Boolean(state.regionSelection),
 		);
 	}
 
@@ -1242,6 +1682,8 @@ export default class PdfHighlighterPlugin extends Plugin {
 		state: AnnotationToolbarState,
 		highlighting: boolean,
 	) {
+		state.regionSelection?.dispose();
+		state.regionSelection = null;
 		if (this.pencilGesture?.pdfView.containerEl === pdfView.containerEl) {
 			if (this.pencilGesture.input.kind === 'pointer') this.cancelledPencilPointerIds.add(this.pencilGesture.input.id);
 			this.cancelPencilGesture(true);
@@ -1272,6 +1714,8 @@ export default class PdfHighlighterPlugin extends Plugin {
 		const state = toolbarRight ? this.annotationToolbars.get(toolbarRight) : undefined;
 		const color = this.settings.colors.find((option) => option.id === colorId);
 		if (!state || !color) return false;
+		state.regionSelection?.dispose();
+		state.regionSelection = null;
 		this.cancelPendingSelectionUpdate();
 		state.file = pdfView.file;
 		state.colorId = colorId;
@@ -1310,7 +1754,8 @@ export default class PdfHighlighterPlugin extends Plugin {
 			const inActivePdf = event.composedPath().some((target) => {
 				if (!isDomNode(target)) return false;
 				const node = target;
-				return pdfView.containerEl.contains(node) || Boolean(toolbarRoot?.contains(node)) || Boolean(focusLeaf?.contains(node));
+				return pdfView.containerEl.contains(node) || Boolean(toolbarRoot?.contains(node)) || Boolean(focusLeaf?.contains(node)) ||
+					Boolean(this.activePopup?.el.ownerDocument === ownerDocument && this.activePopup.el.contains(node));
 			});
 			const rootTarget = event.target === ownerDocument || event.target === ownerDocument.body || event.target === ownerDocument.documentElement;
 			return inActivePdf || rootTarget ? pdfView : null;
@@ -1319,7 +1764,51 @@ export default class PdfHighlighterPlugin extends Plugin {
 		}
 	}
 
+	private handleSelectedAnnotationBackspace(ownerDocument: Document, event: KeyboardEvent) {
+		const selected = this.selectedAnnotation;
+		if (!selected || this.isUnloading || event.defaultPrevented || event.isComposing || event.keyCode === 229 ||
+			event.repeat || event.shiftKey || event.altKey || event.ctrlKey || event.metaKey ||
+			this.activePopup !== selected.popup || !selected.popup.el.isConnected ||
+			selected.popup.el.ownerDocument !== ownerDocument) return;
+		const elements = eventElements(event);
+		if (elements.some(isEditableElement) || isEditableElement(ownerDocument.activeElement) ||
+			hasIgnoredShortcutContext(ownerDocument, elements, ownerDocument.activeElement)) return;
+		const view = this.getFocusedPdfViewForKeyEvent(ownerDocument, event);
+		if (!view || view.containerEl !== selected.capture.pdfView.containerEl || view.file !== selected.capture.file ||
+			!this.isCapturedPdfCurrent(selected.capture)) return;
+		this.consumeKeyboardEvent(event);
+		// Clearing synchronously prevents held/repeated keys deleting another mark.
+		this.hideActiveMenu();
+		void this.performRemoveTarget(selected.capture, selected.target);
+	}
+
+	private handleSelectedAnnotationCopy(ownerDocument: Document, event: KeyboardEvent) {
+		const selected = this.selectedAnnotation;
+		if (!selected?.copy || this.isUnloading || event.defaultPrevented || event.isComposing || event.keyCode === 229 ||
+			event.repeat || !event.metaKey || event.ctrlKey || event.altKey || event.shiftKey ||
+			this.activePopup !== selected.popup || !selected.popup.el.isConnected ||
+			selected.popup.el.ownerDocument !== ownerDocument) return;
+		const elements = eventElements(event);
+		if (elements.some(isEditableElement) || isEditableElement(ownerDocument.activeElement) ||
+			hasIgnoredShortcutContext(ownerDocument, elements, ownerDocument.activeElement)) return;
+		const selection = ownerDocument.defaultView?.getSelection();
+		if (selection && !selection.isCollapsed && selection.toString().length > 0) return;
+		const view = this.getFocusedPdfViewForKeyEvent(ownerDocument, event);
+		if (!view || view.containerEl !== selected.capture.pdfView.containerEl || view.file !== selected.capture.file ||
+			!this.isCapturedPdfCurrent(selected.capture)) return;
+		this.consumeKeyboardEvent(event);
+		selected.copy();
+	}
+
 	private handlePdfKeyboardShortcut(ownerDocument: Document, event: KeyboardEvent) {
+		if (event.key.toLowerCase() === 'c' && event.metaKey) {
+			this.handleSelectedAnnotationCopy(ownerDocument, event);
+			return;
+		}
+		if (event.key === 'Backspace') {
+			this.handleSelectedAnnotationBackspace(ownerDocument, event);
+			return;
+		}
 		const escapeWithoutModifiers = event.key.toLowerCase() === 'escape' &&
 			!event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey;
 		if (event.defaultPrevented || event.isComposing || event.repeat ||
@@ -1396,7 +1885,6 @@ export default class PdfHighlighterPlugin extends Plugin {
 		this.selectionGestureGeneration++;
 		window.clearTimeout(this.selectionUpdateTimer);
 		this.selectionUpdateTimer = 0;
-		this.pendingUpdateMode = null;
 	}
 
 	private isInsideActivePopup(target: EventTarget | null): boolean {
@@ -1410,9 +1898,15 @@ export default class PdfHighlighterPlugin extends Plugin {
 	}
 
 	private hideActiveMenu() {
+		this.clearSelectedAnnotation();
 		this.menuGeneration++;
 		this.activePopup?.hide();
 		this.activePopup = null;
+	}
+
+	private clearSelectedAnnotation() {
+		this.selectedAnnotation?.clearOutline();
+		this.selectedAnnotation = null;
 	}
 
 
@@ -1421,17 +1915,47 @@ export default class PdfHighlighterPlugin extends Plugin {
 	 * most of those clicks have nothing to do with a PDF selection at all, and
 	 * popping error notices for that would be spammy. */
 	private trySelectionContext(pdfView = getActivePdfView(this.app)): SelectionContext | null {
-		if (!pdfView) return null;
-
-		const selection = (pdfView.containerEl.ownerDocument.defaultView ?? window).getSelection();
-		if (!selection || selection.isCollapsed || selection.rangeCount === 0) return null;
-		const range = selection.getRangeAt(0);
-		if (!pdfView.containerEl.contains(range.commonAncestorContainer)) return null;
-		const segments = selectionSegmentsForRange(pdfView, range);
+		const nativeSelection = this.getOwnedNativeSelection(pdfView);
+		if (!nativeSelection) return null;
+		const { pdfView: ownedPdfView, selection, range } = nativeSelection;
+		const segments = selectionSegmentsForRange(ownedPdfView, range);
 		if (!segments) return null;
 
-		const capture = capturePdfTarget(pdfView.file, pdfView);
-		return { capture, pdfView, segments, text: selection.toString() };
+		const capture = capturePdfTarget(ownedPdfView.file, ownedPdfView);
+		return { capture, pdfView: ownedPdfView, range, segments, text: selection.toString() };
+	}
+
+	/** Validates native selection ownership without walking text nodes or
+	 * capturing per-node geometry. Use this for preview and commit eligibility;
+	 * full quote/quad capture stays on actual annotation actions. */
+	private getOwnedNativeSelection(pdfView = getActivePdfView(this.app)): OwnedNativeSelection | null {
+		if (!pdfView) return null;
+		const pane = pdfView.containerEl;
+		const selection = (pane.ownerDocument.defaultView ?? window).getSelection();
+		if (!selection || selection.isCollapsed || selection.rangeCount === 0 ||
+			!selection.anchorNode || !selection.focusNode ||
+			!pane.contains(selection.anchorNode) || !pane.contains(selection.focusNode)) return null;
+		try {
+			const range = selection.getRangeAt(0);
+			if (!pane.contains(range.commonAncestorContainer) ||
+				!pane.contains(range.startContainer) || !pane.contains(range.endContainer)) return null;
+			return { pdfView, selection, range };
+		} catch {
+			return null;
+		}
+	}
+
+	private readPdfSelectionSnapshot(pdfView: ActivePdfView): SelectionSnapshot | null {
+		const ownerDocument = pdfView.containerEl.ownerDocument;
+		const selection = ownerDocument.defaultView?.getSelection();
+		if (!selection || selection.isCollapsed || !selection.anchorNode || !selection.focusNode) return null;
+		if (!pdfView.containerEl.contains(selection.anchorNode) || !pdfView.containerEl.contains(selection.focusNode)) return null;
+		return {
+			anchorNode: selection.anchorNode,
+			anchorOffset: selection.anchorOffset,
+			focusNode: selection.focusNode,
+			focusOffset: selection.focusOffset,
+		};
 	}
 
 	/** Same lookup, but explains itself with a Notice on failure -- for the
@@ -1456,23 +1980,15 @@ export default class PdfHighlighterPlugin extends Plugin {
 		return ctx;
 	}
 
-	/** Coalesces the mouseup-triggered ('full') and selectionchange-triggered
-	 * ('selection-only') checks onto one timer -- see selectionUpdateTimer's
-	 * doc comment. */
-	private scheduleSelectionUpdate(delayMs: number, mode: SelectionUpdateMode, commitSelection: CapturedPdfTarget<TFile, ActivePdfView> | null = null) {
+	/** Coalesces mouseup and pointerup checks onto the shared selection timer. */
+	private scheduleSelectionUpdate(delayMs: number, commitSelection: CapturedPdfTarget<TFile, ActivePdfView> | null = null, editNote = false) {
 		if (this.isUnloading) return;
-		// Not simply last-wins: a late 'selection-only' must not cancel a pending
-		// 'full', or the popup can never be dismissed. See selection-scheduler.ts.
-		if (!shouldReplacePendingUpdate(this.pendingUpdateMode, mode)) return;
-
 		window.clearTimeout(this.selectionUpdateTimer);
-		this.pendingUpdateMode = mode;
 		const gestureGeneration = this.selectionGestureGeneration;
 		this.selectionUpdateTimer = window.setTimeout(() => {
-			this.pendingUpdateMode = null;
 			if (this.isUnloading || this.mouseSelectionDown) return;
-			if (mode === 'full') void this.updateSelectionMenu(gestureGeneration === this.selectionGestureGeneration ? commitSelection : null);
-			else this.updateSelectionToolbarForLiveSelection();
+			const isCurrent = gestureGeneration === this.selectionGestureGeneration;
+			void this.updateSelectionMenu(isCurrent ? commitSelection : null, isCurrent && editNote);
 		}, delayMs);
 	}
 
@@ -1498,17 +2014,12 @@ export default class PdfHighlighterPlugin extends Plugin {
 		this.selectionGestureGeneration++;
 
 		const owner = findPdfViewForNode(getAllPdfViews(this.app), evt.target);
+		this.selectionAtPress = owner ? this.readPdfSelectionSnapshot(owner.view) : null;
 		if (!owner) {
-			this.selectionAtPress = null;
 			this.lastPdfClick = null;
 			return;
 		}
 		const { view: pdfView, pageIndex } = owner;
-		const selection = pdfView.containerEl.ownerDocument.defaultView?.getSelection();
-		this.selectionAtPress = selection && !selection.isCollapsed ? {
-			anchorNode: selection.anchorNode, anchorOffset: selection.anchorOffset,
-			focusNode: selection.focusNode, focusOffset: selection.focusOffset, text: selection.toString(),
-		} : null;
 		const pdfPoint = this.pdfPointAtPress(pdfView, pageIndex, evt.clientX, evt.clientY);
 		if (!pdfPoint) {
 			this.lastPdfClick = null;
@@ -1629,7 +2140,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 		clientY: number,
 		input: PencilInput,
 	): boolean {
-		if (this.isUnloading || this.pencilGesture || !target) return false;
+		if (this.isUnloading || this.pencilGesture || !target || this.isInsideActivePopup(target)) return false;
 		try {
 			const owner = findPdfViewForNode(getAllPdfViews(this.app), target);
 			if (!owner) return false;
@@ -1638,8 +2149,8 @@ export default class PdfHighlighterPlugin extends Plugin {
 			const toolbar = toolbarRight ? this.annotationToolbars.get(toolbarRight) : undefined;
 			if (!toolbar?.highlighting) return false;
 			const color = this.settings.colors.find((option) => option.id === toolbar.colorId) ?? getDefaultColor(this.settings);
-			const textLayer = findRenderedTextLayer(target, pdfView.containerEl);
 			const pageElement = pdfView.getPageElement(pageIndex);
+			const textLayer = findRenderedTextLayer(target, pdfView.containerEl, pageElement);
 			if (!textLayer || pageElement !== textLayer) return false;
 			const selection = beginPencilTextSelection(
 				pdfView.containerEl.ownerDocument,
@@ -1680,7 +2191,8 @@ export default class PdfHighlighterPlugin extends Plugin {
 			!this.isCapturedPdfCurrent(gesture.capture) || !gesture.textLayer.isConnected ||
 			gesture.pdfView.getPageElement(gesture.selection.pageIndex) !== gesture.pageElement ||
 			!gesture.pageElement.contains(gesture.textLayer) ||
-			gesture.pdfView.findPageIndexForNode(gesture.selection.anchor.node) !== gesture.selection.pageIndex) return false;
+			(gesture.selection.anchor &&
+				gesture.pdfView.findPageIndexForNode(gesture.selection.anchor.node) !== gesture.selection.pageIndex)) return false;
 		const toolbarRight = gesture.pdfView.getToolbarRightElement();
 		const toolbar = toolbarRight ? this.annotationToolbars.get(toolbarRight) : undefined;
 		const color = this.settings.colors.find((option) => option.id === gesture.colorId);
@@ -1756,8 +2268,8 @@ export default class PdfHighlighterPlugin extends Plugin {
 		paintOverlay = true,
 	) {
 		const changed = extendPencilTextSelection(gesture.selection, clientX, clientY);
-		if (gesture.selection.moved) this.applyPencilSelectionColor(gesture);
-		if (paintOverlay && (changed || gesture.selection.moved)) this.refreshSelectionOverlay();
+		if (gesture.selection.hasRange) this.applyPencilSelectionColor(gesture);
+		if (paintOverlay && changed) this.refreshSelectionOverlay();
 	}
 
 	private async finishPencilGesture(
@@ -1782,7 +2294,6 @@ export default class PdfHighlighterPlugin extends Plugin {
 			this.refreshSelectionOverlay();
 			return 'tap';
 		}
-		this.applyPencilSelectionColor(gesture);
 		const selection = gesture.pdfView.containerEl.ownerDocument.defaultView?.getSelection();
 		const selectionIsOwned = Boolean(selection && !selection.isCollapsed && selection.rangeCount > 0 &&
 			selection.anchorNode && selection.focusNode && gesture.textLayer.contains(selection.anchorNode) &&
@@ -1851,7 +2362,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 		if (!insideToolbar) this.lastTouchPressPoint = { x: touch.clientX, y: touch.clientY };
 		this.recordPdfPress({ target, clientX: touch.clientX, clientY: touch.clientY });
 		const claimed = this.startPencilGesture(target, touch.clientX, touch.clientY, { kind: 'touch', id: touch.identifier });
-		if (claimed && event.cancelable) event.preventDefault();
+		if (claimed && this.pencilGesture?.selection.anchor && event.cancelable) event.preventDefault();
 	}
 
 	private handleStylusTouchMove(ownerDocument: Document, event: TouchEvent) {
@@ -1869,6 +2380,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 		}
 		const touch = Array.from(event.changedTouches).find((candidate) => candidate.identifier === gesture.input.id);
 		if (!touch) return;
+		gesture.selection.moved ||= hasPencilDragDistance(gesture.selection, touch.clientX, touch.clientY);
 		if (event.cancelable) event.preventDefault();
 		this.queuePencilGestureUpdate(gesture, touch.clientX, touch.clientY);
 	}
@@ -1902,7 +2414,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 		this.lastTouchPressPoint ??= { x: touch.clientX, y: touch.clientY };
 		// A Pencil tap still opens the existing annotation controls. Passing no
 		// commit target prevents a tap-created native selection from auto-saving.
-		this.scheduleSelectionUpdate(0, 'full');
+		this.scheduleSelectionUpdate(0);
 	}
 
 	private handleStylusTouchCancel(ownerDocument: Document, event: TouchEvent) {
@@ -1939,14 +2451,10 @@ export default class PdfHighlighterPlugin extends Plugin {
 	 * A press *inside* the selection is how a long-press that just created one
 	 * arrives here — treating that as "tapped away" would throw away the
 	 * selection the moment the user made it. */
-	private touchPressLandedOutside(selectionCtx: SelectionContext): boolean {
+	private touchPressLandedOutside(nativeSelection: OwnedNativeSelection): boolean {
 		const press = this.lastTouchPressPoint;
 		if (!press) return false;
-
-		const selection = selectionCtx.pdfView.containerEl.ownerDocument.defaultView?.getSelection();
-		if (!selection || selection.rangeCount === 0) return false;
-		const range = selection.getRangeAt(0);
-		const rects = Array.from(range.getClientRects()).map((r) => ({
+		const rects = Array.from(nativeSelection.range.getClientRects()).map((r) => ({
 			left: r.left,
 			top: r.top,
 			right: r.right,
@@ -1956,92 +2464,129 @@ export default class PdfHighlighterPlugin extends Plugin {
 		return rects.length > 0 && !inside;
 	}
 
-	/** Repaints (or clears) the iOS selection overlay. No-op on every other
-	 * platform, where selectionOverlay is null and ::selection does the job. */
-	private refreshSelectionOverlay() {
-		const overlay = this.selectionOverlay;
-		if (!overlay) return;
+	private cancelSelectionOverlayRefresh() {
+		const pending = this.selectionOverlayFrame;
+		if (pending) pending.ownerWindow.cancelAnimationFrame(pending.id);
+		this.selectionOverlayFrame = null;
+	}
 
+	private scheduleSelectionOverlayRefresh(ownerDocument: Document) {
+		if (this.isUnloading || !this.selectionOverlay || this.selectionOverlayDocument !== ownerDocument ||
+			this.selectionOverlayFrame || !ownerDocument.defaultView) return;
+		const ownerWindow = ownerDocument.defaultView;
+		const pending = { id: 0, ownerWindow };
+		this.selectionOverlayFrame = pending;
+		pending.id = ownerWindow.requestAnimationFrame(() => {
+			if (this.selectionOverlayFrame !== pending) return;
+			this.selectionOverlayFrame = null;
+			if (!this.isUnloading && this.selectionOverlayDocument === ownerDocument) this.refreshSelectionOverlay();
+		});
+	}
+
+	/** Repaints the optional iOS preview using native visual boxes only. The
+	 * complete text/quad capture remains on the actual annotation-save path. */
+	private refreshSelectionOverlay() {
+		this.cancelSelectionOverlayRefresh();
+		const overlay = this.selectionOverlay;
+		if (!overlay || this.isUnloading) return;
 		const gesture = this.pencilGesture;
-		const selectionDocument = gesture?.pdfView.containerEl.ownerDocument ?? window.document;
-		const selection = selectionDocument.defaultView?.getSelection();
+		const selectionDocument = this.selectionOverlayDocument ?? gesture?.pdfView.containerEl.ownerDocument;
+		const selection = selectionDocument?.defaultView?.getSelection();
 		if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
 			overlay.update([]);
 			return;
 		}
-		const range = selection.getRangeAt(0);
+		try {
+			const pdfView = gesture?.pdfView ?? getActivePdfView(this.app);
+			if (!pdfView || pdfView.containerEl.ownerDocument !== selectionDocument) {
+				overlay.update([]);
+				return;
+			}
+			this.paintSelectionOverlay(pdfView, selection.getRangeAt(0));
+		} catch {
+			// The optional preview must also clear while a native viewer loads.
+			overlay.update([]);
+		}
+	}
 
-		// Selections elsewhere in Obsidian (a note in a split, the file list) must
-		// not get painted over -- ::selection already handles those correctly.
-		const pdfView = gesture?.pdfView ?? getActivePdfView(this.app);
-		const segments = pdfView ? selectionSegmentsForRange(pdfView, range) : null;
-		if (!pdfView || !segments) {
+	private paintSelectionOverlay(pdfView: ActivePdfView | null, range?: Range) {
+		this.cancelSelectionOverlayRefresh();
+		const overlay = this.selectionOverlay;
+		if (!overlay) return;
+		if (!pdfView || !range || pdfView.containerEl.ownerDocument !== this.selectionOverlayDocument) {
 			overlay.update([]);
 			return;
 		}
-		const previewColor = gesture?.selection.moved && gesture.textLayer.contains(range.commonAncestorContainer)
-			? gesture.colorHex
-			: undefined;
-
-		overlay.update(
-			segments.flatMap((segment) => {
-				const layer = segment.textLayer.getBoundingClientRect();
-				return segment.pageLocalRects.map((rect) => ({
-					left: layer.left + rect.left,
-					top: layer.top + rect.top,
-					width: rect.right - rect.left,
-					height: rect.bottom - rect.top,
-				}));
-			}),
-			previewColor,
-		);
+		const gesture = this.pencilGesture;
+		const previewColor = gesture?.selection.moved && gesture.pdfView.containerEl === pdfView.containerEl &&
+			gesture.textLayer.contains(range.commonAncestorContainer) ? gesture.colorHex : undefined;
+		overlay.update(liveSelectionOverlayRects(pdfView, range), previewColor);
 	}
 
-	private updateSelectionToolbarForLiveSelection() {
-		// Keyboard and native handle adjustments must never commit a partial
-		// selection. The fixed palette stays available throughout the gesture.
-		this.ensureToolbarButtons();
-	}
-
-	private hasNewSelection(ctx: SelectionContext): boolean {
-		const selection = ctx.pdfView.containerEl.ownerDocument.defaultView?.getSelection();
-		if (!selection || selection.isCollapsed) return false;
+	private hasNewSelection(selection: Selection): boolean {
+		if (selection.isCollapsed) return false;
 		const before = this.selectionAtPress;
 		return !before || before.anchorNode !== selection.anchorNode || before.anchorOffset !== selection.anchorOffset ||
-			before.focusNode !== selection.focusNode || before.focusOffset !== selection.focusOffset || before.text !== selection.toString();
+			before.focusNode !== selection.focusNode || before.focusOffset !== selection.focusOffset;
 	}
 
 	/** Commit a completed selection only in Highlight mode, otherwise leave it
 	 * available for copying or the fixed palette. Annotation clicks retain their
 	 * existing note, recolour and removal controls. */
-	private async updateSelectionMenu(commitSelection: CapturedPdfTarget<TFile, ActivePdfView> | null = null) {
+	private async updateSelectionMenu(commitSelection: CapturedPdfTarget<TFile, ActivePdfView> | null = null, editNote = false) {
 		if (this.isUnloading) return;
-		// Unconditional: if a selectionchange ever fails to arrive, this is the
-		// only place that notices the painted overlay no longer matches reality.
-		this.refreshSelectionOverlay();
-
-		const selectionCtx = this.trySelectionContext(commitSelection?.pdfView);
-		const pressLandedOutside = selectionCtx !== null && this.touchPressLandedOutside(selectionCtx);
+		const click = this.lastPdfClick;
+		if (editNote && click) {
+			// Double-click also selects a word natively. Resolve annotation intent
+			// before Highlight mode can commit that word as a new annotation.
+			const generation = this.menuGeneration;
+			const gesture = this.selectionGestureGeneration;
+			const found = await this.showCandidatesForClick(click, false, undefined, true);
+			if (found !== false || this.isUnloading ||
+				this.menuGeneration !== generation || this.selectionGestureGeneration !== gesture || this.lastPdfClick !== click) return;
+		}
+		const nativeSelection = this.getOwnedNativeSelection(commitSelection?.pdfView);
+		// Final pointer-up painting is immediate. Native rectangles supply the
+		// preview; complete text/quad capture waits until a changed Highlight-mode
+		// selection is actually going to be saved.
+		this.paintSelectionOverlay(nativeSelection?.pdfView ?? null, nativeSelection?.range);
+		const pressLandedOutside = nativeSelection !== null && this.touchPressLandedOutside(nativeSelection);
 		this.lastTouchPressPoint = null; // one-shot, see the field's doc comment
-		if (selectionCtx && pressLandedOutside) {
+		if (nativeSelection && pressLandedOutside) {
 			// iOS keeps a selection alive when you tap away from it, so "there is
 			// still a selection" is not evidence the user still wants one. Drop it
 			// ourselves and carry on into the remove-menu check below, exactly as
 			// if the press had found no selection.
-			selectionCtx.pdfView.containerEl.ownerDocument.defaultView?.getSelection()?.removeAllRanges();
+			nativeSelection.selection.removeAllRanges();
 			this.refreshSelectionOverlay();
 			this.hideActiveMenu();
 			await this.maybeShowRemoveMenu();
 			return;
 		}
-		if (selectionCtx) {
-			this.ensureToolbarButtons();
-			const right = selectionCtx.pdfView.getToolbarRightElement();
-			const state = right ? this.annotationToolbars.get(right) : undefined;
-			if (state?.highlighting && this.hasNewSelection(selectionCtx) && commitSelection?.file === selectionCtx.capture.file &&
-				commitSelection.pdfView.containerEl === selectionCtx.pdfView.containerEl && this.isCapturedPdfCurrent(commitSelection)) {
-				const color = this.settings.colors.find((option) => option.id === state.colorId) ?? getDefaultColor(this.settings);
-				await this.performHighlight(selectionCtx, hexToRgbColor(color.hex));
+		if (nativeSelection) {
+			const completedSelection = Boolean(commitSelection && this.hasNewSelection(nativeSelection.selection) &&
+				commitSelection.file === nativeSelection.pdfView.file &&
+				commitSelection.pdfView.containerEl === nativeSelection.pdfView.containerEl && this.isCapturedPdfCurrent(commitSelection));
+			if (completedSelection) {
+				const right = nativeSelection.pdfView.getToolbarRightElement();
+				let state = right ? this.annotationToolbars.get(right) : undefined;
+				if (right && !state) {
+					this.ensureAnnotationToolbar(nativeSelection.pdfView, right);
+					state = this.annotationToolbars.get(right);
+				}
+				if (state?.highlighting) {
+					const selectionCtx = this.trySelectionContext(nativeSelection.pdfView);
+					if (!selectionCtx) {
+						this.hideActiveMenu();
+						await this.maybeShowRemoveMenu();
+						return;
+					}
+					if (commitSelection!.file === selectionCtx.capture.file &&
+						commitSelection!.pdfView.containerEl === selectionCtx.pdfView.containerEl) {
+						const color = this.settings.colors.find((option) => option.id === state.colorId) ?? getDefaultColor(this.settings);
+						await this.performHighlight(selectionCtx, hexToRgbColor(color.hex));
+					}
+				}
 			}
 			return;
 		}
@@ -2056,42 +2601,63 @@ export default class PdfHighlighterPlugin extends Plugin {
 		await this.showCandidatesForClick(click, false);
 	}
 
-	private async showCandidatesForClick(click: CapturedPdfPress<TFile, ActivePdfView>, notify: boolean) {
-		if (this.isUnloading) return;
+	private async showCandidatesForClick(
+		click: CapturedPdfPress<TFile, ActivePdfView>,
+		notify: boolean,
+		areaInteraction?: { isCurrent(): boolean; regionsOnly: boolean },
+		editNote = false,
+	): Promise<boolean | null> {
+		// Only a completed lookup with no hit may fall back to word selection.
+		if (this.isUnloading) return null;
 		const menuGeneration = this.menuGeneration;
+		const gestureGeneration = this.selectionGestureGeneration;
 		const { capture } = click;
 		const pdfView = capture.pdfView;
 		if (!this.isCapturedPdfCurrent(capture)) {
 			if (notify) new Notice('Study PDF: the PDF where you clicked is no longer open at that location.');
-			return;
+			return null;
 		}
 		const resolved = resolveCapturedPdfPress(click);
 		try {
 			const index = await this.getHighlightIndexForCapture(capture);
-			if (this.isUnloading || menuGeneration !== this.menuGeneration || this.mouseSelectionDown ||
-				this.lastPdfClick !== click || !this.isCapturedPdfCurrent(capture)) return;
-			const infos = findHighlightsInIndexAtPoint(index, resolved.pageIndex, resolved.point);
+			if (this.isUnloading || menuGeneration !== this.menuGeneration ||
+				(areaInteraction ? !areaInteraction.isCurrent() : this.mouseSelectionDown || this.lastPdfClick !== click) ||
+				(editNote && gestureGeneration !== this.selectionGestureGeneration) || !this.isCapturedPdfCurrent(capture)) return null;
+			const infos = findHighlightsInIndexAtPoint(index, resolved.pageIndex, resolved.point)
+				.filter((info) => !areaInteraction?.regionsOnly || Boolean(info.regionBox));
 			if (!infos.length) {
 				if (notify) new Notice('Study PDF: no highlight found where you clicked.');
-				return;
+				return false;
 			}
 			// A delayed index build must not move an earlier press onto a later pane
 			// or location. The captured file and view stay attached to this chooser.
 			const doc = pdfView.containerEl.ownerDocument;
-			const position = { x: click.clientX, y: click.clientY + 4 };
+			const position = { x: click.clientX, y: click.clientY + 8, aboveY: click.clientY - 8 };
 			const candidates: CandidateChoice[] = infos.map((info) => ({ ...info, pageIndex: resolved.pageIndex }));
+			if (editNote) {
+				const selection = this.getOwnedNativeSelection(pdfView);
+				selection?.selection.removeAllRanges();
+				this.paintSelectionOverlay(null);
+				const candidate = candidates.length === 1 ? candidates[0] : null;
+				if (candidate?.target) {
+					this.openAnnotationNote(capture, candidate.target, candidate.note, position);
+					return true;
+				}
+			}
 			this.showCandidateChooser(doc, position, candidates, capture);
+			return true;
 		} catch (error) {
 			// Silent: this is a passive background check, not an explicit user action.
 			if (notify && !this.isUnloading && menuGeneration === this.menuGeneration) {
 				new Notice(`Study PDF: could not inspect highlights -- ${(error as Error).message}`, 0);
 			}
+			return null;
 		}
 	}
 
 	private showCandidateChooser(
 		doc: Document,
-		position: { x: number; y: number },
+		position: PopupAnchor,
 		candidates: readonly CandidateChoice[],
 		capture: CapturedPdfTarget<TFile, ActivePdfView>,
 	) {
@@ -2102,24 +2668,36 @@ export default class PdfHighlighterPlugin extends Plugin {
 			defaultColorId: this.settings.defaultColorId,
 		};
 		let popup: IconPopup;
+		const copyCandidate = (candidate: CandidateChoice, dismiss = true) => {
+			if (this.isUnloading || !this.isCapturedPdfCurrent(capture)) return;
+			if (candidate.regionBox) {
+				void copyPdfRegionImage(capture.pdfView, candidate.pageIndex, candidate.regionBox,
+					() => !this.isUnloading && this.isCapturedPdfCurrent(capture)).then(
+					() => { if (dismiss) { new Notice('Selected area copied as an image.'); if (this.activePopup === popup) this.hideActiveMenu(); } },
+					(error: unknown) => new Notice(`Could not copy the selected area: ${(error as Error).message}`),
+				);
+				return;
+			}
+			void copyPdfHighlightText(capture.pdfView, candidate.pageIndex, candidate,
+				() => !this.isUnloading && this.isCapturedPdfCurrent(capture)).then(
+				() => {
+					if (dismiss) {
+						new Notice('Study PDF: copied highlighted text to the clipboard.');
+						if (this.activePopup === popup) popup.hide();
+					}
+				},
+				(error: unknown) => new Notice(`Could not copy the highlighted text: ${(error as Error).message}`),
+			);
+		};
 		popup = showColorPaletteModal(doc, position, candidates, palette.colors, palette.defaultColorId, {
 			onRecolor: (target, color) => {
 				this.hideActiveMenu();
-				void this.performRecolor(capture, target, { ...color });
+				void this.performRecolor(capture, target, color);
 			},
 			onEditNote: (candidate) => {
-				if (!candidate.target) return;
-				const target = candidate.target;
-				this.hideActiveMenu();
-				let notePopup: IconPopup;
-				notePopup = showNoteEditorPopup(this.app, doc, position, {
-					initial: candidate.note ?? '',
-					onSave: (note) => this.performSetNoteForTarget(capture, target, note),
-					onSaved: () => this.hideActiveMenu(),
-					onCancel: () => this.hideActiveMenu(),
-				});
-				this.activePopup = notePopup;
+				if (candidate.target) this.openAnnotationNote(capture, candidate.target, candidate.note, position);
 			},
+			onCopy: (candidate) => copyCandidate(candidate),
 			onRemove: (candidate) => {
 				if (!candidate.target) return;
 				const target = candidate.target;
@@ -2127,10 +2705,19 @@ export default class PdfHighlighterPlugin extends Plugin {
 				void this.performRemoveTarget(capture, target);
 			},
 			onDismiss: () => {
+				if (this.selectedAnnotation?.popup === popup) this.clearSelectedAnnotation();
 				if (this.activePopup === popup) { this.activePopup = null; this.menuGeneration++; }
 			},
 		});
 		this.activePopup = popup;
+		const candidate = candidates.length === 1 ? candidates[0] : undefined;
+		if (candidate?.target) {
+			this.selectedAnnotation = {
+				capture, target: candidate.target, popup,
+				copy: canCopyHighlight(candidate) ? () => copyCandidate(candidate, false) : null,
+				clearOutline: capture.pdfView.markSelectedAnnotation?.(candidate.target) ?? (() => {}),
+			};
+		}
 	}
 
 	/** Writes (or refreshes) the sibling "<PDF> (highlights).md" note.
@@ -2253,7 +2840,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 			}, async (entries, _snapshotFingerprint, assertSourceUnchanged) => {
 				const notePath = siblingNotePath(pdfView.file.parent?.path, pdfView.file.basename, 'flashcards');
 				const existingFile = this.app.vault.getAbstractFileByPath(notePath);
-				const withNotes = entries.filter((entry) => (entry.note ?? '').trim().length > 0);
+				const withNotes = entries.filter((entry) => !entry.standaloneNote && (entry.note ?? '').trim().length > 0);
 				if (withNotes.length === 0 && !existingFile) {
 					new Notice('Study PDF: add a note to a highlight first — the note becomes the question.');
 					return;
@@ -2302,6 +2889,19 @@ export default class PdfHighlighterPlugin extends Plugin {
 		}
 	}
 
+	private highlightRegion(view: ActivePdfView, region: SelectedPdfRegion, hex: string) {
+		const capture = capturePdfTarget(view.file, view);
+		if (!this.isCapturedPdfCurrent(capture)) return;
+		// Freeze the selected PDF coordinates; resizing cannot move an in-flight save.
+		const viewport = region.viewport;
+		const rect = region.pageLocalRect;
+		void this.performHighlight({
+			capture, pdfView: view, text: '', isRegion: true,
+			segments: [{ pageIndex: region.pageIndex, textLayer: region.pageElement,
+				pageLocalRects: [rect], viewport, text: '' }],
+		}, hexToRgbColor(hex));
+	}
+
 	private async highlightCurrentSelection(color: RgbColor) {
 		const ctx = this.getSelectionContextOrNotify();
 		if (!ctx) return;
@@ -2318,18 +2918,21 @@ export default class PdfHighlighterPlugin extends Plugin {
 		const ownerDocument = pdfView.containerEl.ownerDocument;
 		const ownerWindow = ownerDocument.defaultView;
 		if (!ownerWindow || ownerWindow.closed) return;
+		const expandTop = ctx.isRegion ? 0 : HIGHLIGHT_EXPAND_TOP;
+		const expandBottom = ctx.isRegion ? 0 : HIGHLIGHT_EXPAND_BOTTOM;
 		const annotations = segments.map((segment) => {
 			const { quadPoints, box } = selectionRectsToQuadPoints(
 				segment.pageLocalRects,
 				segment.viewport,
-				HIGHLIGHT_EXPAND_TOP,
-				HIGHLIGHT_EXPAND_BOTTOM,
+				expandTop,
+				expandBottom,
 			);
 			return {
 				pageIndex: segment.pageIndex,
 				quadPoints,
 				box,
 				color,
+				isRegion: ctx.isRegion,
 				quote: segments.length === 1 ? normalizeQuote(ctx.text) : segment.text,
 			};
 		});
@@ -2349,9 +2952,9 @@ export default class PdfHighlighterPlugin extends Plugin {
 					const height = r.bottom - r.top;
 					return {
 						left: r.left + origin.left,
-						top: r.top + origin.top - height * HIGHLIGHT_EXPAND_TOP,
+						top: r.top + origin.top - height * expandTop,
 						width: r.right - r.left,
-						height: height * (1 + HIGHLIGHT_EXPAND_TOP + HIGHLIGHT_EXPAND_BOTTOM),
+						height: height * (1 + expandTop + expandBottom),
 					};
 				}),
 				color: colorCss,
@@ -2367,12 +2970,13 @@ export default class PdfHighlighterPlugin extends Plugin {
 			ownerWindow.addEventListener('beforeunload', abortAction, { once: true });
 			const previews = segments.flatMap((segment) => {
 				return segment.textLayer.isConnected
-					? [showHighlightPreview(segment.textLayer, segment.pageLocalRects, colorCss, HIGHLIGHT_EXPAND_TOP, HIGHLIGHT_EXPAND_BOTTOM)]
+					? [showHighlightPreview(segment.textLayer, segment.pageLocalRects, colorCss, expandTop, expandBottom)]
 					: [];
 			});
 			preview = previews.length > 0 ? { dispose: () => { for (const item of previews) item.dispose(); } } : null;
 			if (preview) this.pendingPreviews.add(preview);
 			ownerWindow.getSelection()?.removeAllRanges();
+			this.paintSelectionOverlay(null);
 			this.hideActiveMenu();
 
 			const result = await this.mutateCapturedPdf(
@@ -2385,14 +2989,13 @@ export default class PdfHighlighterPlugin extends Plugin {
 						this.app.workspace.containerEl.ownerDocument.defaultView ?? window,
 					);
 					return {
-						bytes: await addHighlightAnnotations(existingBytes, annotations),
+						bytes: await (ctx.isRegion ? addHighlightAnnotations : replaceOverlappingHighlightAnnotations)(existingBytes, annotations),
 						value: undefined,
 					};
 				},
 				paints,
 				() => preview?.dispose(),
 				undefined,
-				false,
 				action.signal,
 			);
 			if (!result.changed) {
@@ -2435,7 +3038,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 		this.hideActiveMenu();
 		try {
 			const result = await this.mutateCapturedPdf(capture, [target.pageIndex], async (existingBytes) => {
-				const updated = await setHighlightColorAt(existingBytes, { ...target, color: { ...color } });
+				const updated = await setHighlightColorAt(existingBytes, { ...target, color });
 				return { bytes: updated.bytes, value: updated.updatedCount, changed: updated.updatedCount > 0 };
 			});
 			if (!result.changed || result.value === 0) return; // same-color selection: no write was needed
@@ -2529,7 +3132,6 @@ export default class PdfHighlighterPlugin extends Plugin {
 				(_beforeBytes, _afterBytes, value) => {
 					if (value.status === 'ready' && !value.transition.commit()) this.annotationHistory.clearPath(capture.path);
 				},
-				true,
 			);
 			if (this.isUnloading) return;
 			this.refreshAnnotationToolbars();
@@ -2551,7 +3153,6 @@ export default class PdfHighlighterPlugin extends Plugin {
 		fallbackPaint?: CurtainPaint | readonly CurtainPaint[],
 		onPreviewReady?: () => void,
 		onSaved?: (beforeBytes: Uint8Array, afterBytes: Uint8Array, value: T) => void,
-		verifyBytesBeforeWrite = false,
 		actionSignal?: AbortSignal,
 	) {
 		const previewByView = new Map<HTMLElement, PdfUpdatePreview>();
@@ -2653,15 +3254,13 @@ export default class PdfHighlighterPlugin extends Plugin {
 						fallbackItem.position = preserveReadingPosition(this.app, view);
 					}
 
-					if (verifyBytesBeforeWrite) {
-						assertMutationActive();
-						const currentBytes = new Uint8Array(await this.app.vault.readBinary(capture.file));
-						assertMutationActive();
-						if (!exactBytesEqual(beforeBytes, currentBytes)) {
-							this.annotationHistory.clearPath(capture.path);
-							if (!this.isUnloading) this.refreshAnnotationToolbars();
-							throw new Error(`PDF changed since this operation began: ${capture.path}`);
-						}
+					assertMutationActive();
+					const currentBytes = new Uint8Array(await this.app.vault.readBinary(capture.file));
+					assertMutationActive();
+					if (!exactBytesEqual(beforeBytes, currentBytes)) {
+						this.annotationHistory.clearPath(capture.path);
+						if (!this.isUnloading) this.refreshAnnotationToolbars();
+						throw new Error(`PDF changed since this operation began: ${capture.path}`);
 					}
 					assertMutationActive();
 					await this.app.vault.modifyBinary(capture.file, toArrayBuffer(bytes));
@@ -2710,6 +3309,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 					} catch {
 						result = 'unavailable';
 					}
+					if (result === 'refreshed') this.noteMarkerViews.get(view.containerEl)?.watcher?.refresh(activePageIndexes);
 					if (this.isUnloading) {
 						disposeOwnedResources();
 						return;
@@ -2724,6 +3324,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 					fallbackItem.position = preserveReadingPosition(this.app, view);
 					try {
 						await view.forceReload();
+						this.syncPdfNoteMarkers();
 					} catch (error) {
 						fallbackItem.curtain?.cancel();
 						fallbackItem.position?.cancel();

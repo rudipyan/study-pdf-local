@@ -36,6 +36,47 @@ describe('refreshPageCanvas', () => {
 		expect(f.context.drawImage).not.toHaveBeenCalled();
 		expect(f.scratch.width).toBe(0);
 	});
+
+	it('copies a completed preview raster without rendering the updated page again', async () => {
+		const f = fixture();
+		const render = vi.fn(() => ({ promise: Promise.resolve() }));
+		const raster = { width: 1200, height: 1600 } as HTMLCanvasElement;
+
+		await refreshPageCanvas(f.pageView, { rotate: 0, render }, () => true, raster);
+
+		expect(render).not.toHaveBeenCalled();
+		expect(f.context.drawImage).toHaveBeenCalledWith(raster, 0, 0);
+		expect(f.scratch.width).toBe(0);
+	});
+
+	it('falls back to rendering when the supplied preview raster is stale', async () => {
+		const f = fixture();
+		const render = vi.fn(() => ({ promise: Promise.resolve() }));
+		const raster = { width: 600, height: 800 } as HTMLCanvasElement;
+
+		await refreshPageCanvas(f.pageView, { rotate: 0, render }, () => true, raster);
+
+		expect(render).toHaveBeenCalledOnce();
+		expect(f.context.drawImage).toHaveBeenCalledWith(f.scratch, 0, 0);
+	});
+
+	it('falls back to the live render when annotation canvases are present', async () => {
+		const f = fixture();
+		const annotationCanvasMap = new Map([['form-field', {}]]);
+		f.pageView._annotationCanvasMap = annotationCanvasMap;
+		f.pageView._getRenderingContext = vi.fn((canvasContext, transform) => ({
+			canvasContext, transform, annotationCanvasMap,
+		}));
+		const render = vi.fn(() => ({ promise: Promise.resolve() }));
+		const raster = { width: 1200, height: 1600 } as HTMLCanvasElement;
+
+		await refreshPageCanvas(f.pageView, { rotate: 0, render }, () => true, raster);
+
+		expect(render).toHaveBeenCalledOnce();
+		expect(f.pageView._getRenderingContext).toHaveBeenCalledWith(f.scratchContext, [2, 0, 0, 2, 0, 0]);
+		expect(f.pageView._getRenderingContext.mock.results[0]?.value.annotationCanvasMap).toBe(annotationCanvasMap);
+		expect(f.context.drawImage).toHaveBeenCalledWith(f.scratch, 0, 0);
+	});
 });
 
 describe('shouldSuppressPdfViewReload', () => {

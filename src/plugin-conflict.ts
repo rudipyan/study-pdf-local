@@ -31,7 +31,7 @@ export async function inspectStudyPdfPluginConflict(
 		return 'community-plugins.json must contain an array of string plugin IDs.';
 	}
 	if (value.includes('study-pdf')) {
-		return 'Disable the original Study PDF plugin before enabling Study PDF Local.';
+		return 'Disable the original Study PDF plugin before enabling Rudi\'s Study PDF.';
 	}
 	return null;
 }
